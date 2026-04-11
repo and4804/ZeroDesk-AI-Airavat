@@ -36,6 +36,9 @@ class SessionMetadataRequest(BaseModel):
     language: Optional[str] = None
     platform: Optional[str] = None
     webrtc_supported: Optional[bool] = None
+    canvas_hash: Optional[str] = None
+    browser_geo_lat: Optional[float] = None
+    browser_geo_lng: Optional[float] = None
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -93,6 +96,7 @@ async def create_session(req: SessionCreateRequest):
     """Create a new session and return a tokenised link."""
     session_id = str(uuid.uuid4())
     token = _create_token(session_id)
+    expires_at = (datetime.utcnow() + timedelta(minutes=settings.JWT_EXPIRY_MINUTES)).isoformat()
     
     # Persist to SQLite
     db = await get_db()
@@ -110,6 +114,7 @@ async def create_session(req: SessionCreateRequest):
     store.create(session_id, {
         "applicant_name": req.applicant_name,
         "applicant_id": req.applicant_id,
+        "expires_at": expires_at,
     })
     
     # Audit event
@@ -122,6 +127,7 @@ async def create_session(req: SessionCreateRequest):
         "session_id": session_id,
         "token": token,
         "join_url": f"{settings.FRONTEND_URL}/session/{session_id}?token={token}",
+        "expires_at": expires_at,
         "expires_in_minutes": settings.JWT_EXPIRY_MINUTES,
     }
 
@@ -150,7 +156,10 @@ async def validate_session(session_id: str, token: str):
     payload = _validate_token(token)
     if payload["session_id"] != session_id:
         raise HTTPException(status_code=403, detail="Token does not match session")
-    return {"valid": True, "session_id": session_id}
+    # Include current pipeline stage per doc spec
+    session = store.get(session_id)
+    stage = session.get("pipeline_stage", "SESSION_INIT") if session else "SESSION_INIT"
+    return {"valid": True, "session_id": session_id, "stage": stage}
 
 
 @router.post("/{session_id}/metadata")
@@ -165,8 +174,24 @@ async def store_metadata(session_id: str, req: SessionMetadataRequest, request: 
     if "," in ip:
         ip = ip.split(",")[0].strip()
     
-    # Get geolocation
-    geo = await _get_geolocation(ip)
+    # Get geolocation — prefer browser GPS if provided, fallback to IP-based
+    if req.browser_geo_lat is not None and req.browser_geo_lng is not None:
+        geo = {
+            "city": "Browser GPS",
+            "country": "Unknown",
+            "lat": req.browser_geo_lat,
+            "lon": req.browser_geo_lng,
+            "source": "browser_geolocation",
+        }
+        # Also fetch IP geo for fraud comparison later
+        ip_geo = await _get_geolocation(ip)
+        geo["ip_city"] = ip_geo.get("city", "Unknown")
+        geo["ip_country"] = ip_geo.get("country", "Unknown")
+        geo["is_proxy"] = ip_geo.get("is_proxy", False)
+        geo["is_hosting"] = ip_geo.get("is_hosting", False)
+    else:
+        geo = await _get_geolocation(ip)
+        geo["source"] = "ip_lookup"
     
     # Record velocity for fraud detection
     store.record_velocity(req.device_fingerprint)
@@ -182,6 +207,7 @@ async def store_metadata(session_id: str, req: SessionMetadataRequest, request: 
         "language": req.language,
         "platform": req.platform,
         "webrtc_supported": req.webrtc_supported,
+        "canvas_hash": req.canvas_hash,
         "status": "active",
     }
     store.update(session_id, metadata)
@@ -205,9 +231,20 @@ async def store_metadata(session_id: str, req: SessionMetadataRequest, request: 
         "geolocation": geo,
         "device_fingerprint": req.device_fingerprint[:16] + "...",
         "platform": req.platform,
+        "canvas_hash": req.canvas_hash,
     })
     
     return {"status": "ok", "ip": ip, "geolocation": geo}
+
+
+@router.post("/{session_id}/heartbeat")
+async def heartbeat(session_id: str):
+    """Renew session heartbeat. Called every 30s by frontend."""
+    session = store.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    store.update(session_id, {"last_heartbeat": datetime.utcnow().isoformat()})
+    return {"status": "alive", "session_id": session_id}
 
 
 @router.post("/{session_id}/end")
@@ -232,6 +269,30 @@ async def end_session(session_id: str):
     await audit.emit(session_id, "SESSION_ENDED", "SESSION_COMPLETE", {})
     
     return {"status": "completed", "session_id": session_id}
+
+
+@router.delete("/{session_id}")
+async def delete_session(session_id: str, token: str):
+    """Terminate and delete a session. Requires valid token."""
+    payload = _validate_token(token)
+    if payload["session_id"] != session_id:
+        raise HTTPException(status_code=403, detail="Token does not match session")
+    
+    store.delete(session_id)
+    
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE sessions SET status = 'terminated', updated_at = datetime('now') WHERE id = ?",
+            (session_id,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+    
+    await audit.emit(session_id, "SESSION_TERMINATED", "SESSION_INIT", {})
+    
+    return {"terminated": True, "session_id": session_id}
 
 
 @router.get("")

@@ -60,6 +60,51 @@ export default function SessionPage() {
     return Math.abs(hash).toString(36) + Date.now().toString(36);
   }
 
+  // Generate canvas hash for device fingerprinting
+  function getCanvasHash(): string {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 200;
+      canvas.height = 50;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return '';
+      ctx.textBaseline = 'top';
+      ctx.font = '14px Arial';
+      ctx.fillStyle = '#f60';
+      ctx.fillRect(125, 1, 62, 20);
+      ctx.fillStyle = '#069';
+      ctx.fillText('fingerprint', 2, 15);
+      ctx.fillStyle = 'rgba(102,204,0,0.7)';
+      ctx.fillText('fingerprint', 4, 17);
+      const dataUrl = canvas.toDataURL();
+      // Simple hash of the last 64 chars
+      let h = 0;
+      const tail = dataUrl.slice(-64);
+      for (let i = 0; i < tail.length; i++) {
+        h = ((h << 5) - h) + tail.charCodeAt(i);
+        h |= 0;
+      }
+      return Math.abs(h).toString(36);
+    } catch {
+      return '';
+    }
+  }
+
+  // Get browser geolocation (GPS)
+  function getBrowserGeo(): Promise<{ lat: number; lng: number } | null> {
+    return new Promise((resolve) => {
+      if (!navigator.geolocation) {
+        resolve(null);
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+        () => resolve(null),
+        { timeout: 5000, maximumAge: 60000 }
+      );
+    });
+  }
+
   // TTS speak
   function speak(text: string) {
     if ('speechSynthesis' in window) {
@@ -74,10 +119,30 @@ export default function SessionPage() {
 
   // Initialize session
   useEffect(() => {
+    let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+
     async function init() {
       try {
+        // Step 1: Validate the tokenised link
+        if (!token) {
+          setError('No session token provided. Please use a valid session link.');
+          setStatus('error');
+          return;
+        }
+
+        setStatus('validating');
+        try {
+          await api.validateSession(sessionId, token);
+        } catch {
+          setError('Invalid or expired session link. Please request a new one.');
+          setStatus('error');
+          return;
+        }
+
+        // Step 2: Capture device metadata + browser geolocation
         setStatus('initializing');
-        // Store device metadata
+        const browserGeo = await getBrowserGeo();
+
         await api.storeMetadata(sessionId, {
           device_fingerprint: getFingerprint(),
           user_agent: navigator.userAgent,
@@ -86,13 +151,16 @@ export default function SessionPage() {
           language: navigator.language,
           platform: navigator.platform,
           webrtc_supported: !!window.RTCPeerConnection,
+          canvas_hash: getCanvasHash(),
+          browser_geo_lat: browserGeo?.lat ?? null,
+          browser_geo_lng: browserGeo?.lng ?? null,
         });
 
-        // Advance pipeline
+        // Step 3: Advance pipeline
         await api.advancePipeline(sessionId);
         setCurrentStage('METADATA_CAPTURE');
 
-        // Start video
+        // Step 4: Start video (local camera preview)
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
           streamRef.current = stream;
@@ -108,8 +176,13 @@ export default function SessionPage() {
         setAgentMessage('Great! Your session is active. Please tell me about yourself — your name, age, employment, income, and the loan you need. You can also type below.');
         speak('Great! Your session is active. Please tell me about yourself. Your name, age, employment, income, and the loan you need.');
 
-        // Start frame capture for liveness
+        // Step 5: Start frame capture for liveness
         startFrameCapture();
+
+        // Step 6: Start heartbeat (every 30s)
+        heartbeatInterval = setInterval(() => {
+          api.heartbeat(sessionId).catch(() => {});
+        }, 30000);
 
       } catch (err) {
         setError((err as Error).message);
@@ -121,6 +194,7 @@ export default function SessionPage() {
     return () => {
       streamRef.current?.getTracks().forEach(t => t.stop());
       window.speechSynthesis?.cancel();
+      if (heartbeatInterval) clearInterval(heartbeatInterval);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);

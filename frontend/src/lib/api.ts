@@ -141,6 +141,19 @@ export async function getAnalytics() {
   return apiCall('/api/compliance/analytics');
 }
 
+// Session management
+export async function validateSession(sessionId: string, token: string) {
+  return apiCall(`/api/sessions/${sessionId}/validate?token=${encodeURIComponent(token)}`);
+}
+
+export async function heartbeat(sessionId: string) {
+  return apiCall(`/api/sessions/${sessionId}/heartbeat`, { method: 'POST' });
+}
+
+export async function deleteSession(sessionId: string, token: string) {
+  return apiCall(`/api/sessions/${sessionId}?token=${encodeURIComponent(token)}`, { method: 'DELETE' });
+}
+
 // STT WebSocket
 export function createSTTWebSocket(sessionId: string): WebSocket {
   return new WebSocket(`${WS_BASE}/api/stt/ws/${sessionId}`);
