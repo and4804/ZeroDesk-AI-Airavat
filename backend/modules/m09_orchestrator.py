@@ -1,6 +1,7 @@
 """
 M09 — Agentic Orchestration, Recovery & Fallback Handling
-Stateful session manager with FSM, failure modes, and recovery paths.
+Stateful session manager with FSM, failure modes, recovery paths,
+and structured AI interview sub-states.
 """
 
 import json
@@ -19,12 +20,22 @@ router = APIRouter(prefix="/api/orchestrator", tags=["M09 - Orchestrator"])
 
 
 # ──────────────────────────────────────────────────────────────────
-# Pipeline Stages (FSM States)
+# Pipeline Stages (FSM States) — includes interview sub-states
 # ──────────────────────────────────────────────────────────────────
 
 class PipelineStage(str, Enum):
     SESSION_INIT = "SESSION_INIT"
     METADATA_CAPTURE = "METADATA_CAPTURE"
+    # --- Interview sub-states ---
+    INTERVIEW_GREETING = "INTERVIEW_GREETING"
+    AWAIT_NAME = "AWAIT_NAME"
+    AWAIT_AGE = "AWAIT_AGE"
+    AWAIT_EMPLOYMENT = "AWAIT_EMPLOYMENT"
+    AWAIT_INCOME = "AWAIT_INCOME"
+    AWAIT_LOAN_PURPOSE = "AWAIT_LOAN_PURPOSE"
+    AWAIT_AMOUNT = "AWAIT_AMOUNT"
+    AWAIT_CONSENT = "AWAIT_CONSENT"
+    # --- Post-interview pipeline ---
     STT_ACTIVE = "STT_ACTIVE"
     FIELD_EXTRACTION = "FIELD_EXTRACTION"
     CONSENT_CHECK = "CONSENT_CHECK"
@@ -38,10 +49,56 @@ class PipelineStage(str, Enum):
     SESSION_FAILED = "SESSION_FAILED"
 
 
-# Valid transitions
+# ──────────────────────────────────────────────────────────────────
+# Interview Question Templates
+# ──────────────────────────────────────────────────────────────────
+
+INTERVIEW_QUESTIONS = {
+    "INTERVIEW_GREETING": "Hello! I'm your AI loan advisor. I'll guide you through a quick application process. Let's start — what is your full name?",
+    "AWAIT_NAME": "Could you please tell me your full name?",
+    "AWAIT_AGE": "Thank you, {name}! How old are you?",
+    "AWAIT_EMPLOYMENT": "Great. And what type of employment do you have? Are you salaried, self-employed, or running a business?",
+    "AWAIT_INCOME": "What is your approximate monthly income in rupees?",
+    "AWAIT_LOAN_PURPOSE": "What would you like the loan for? For example, home improvement, education, medical expenses, or something else?",
+    "AWAIT_AMOUNT": "And how much loan amount are you looking for?",
+    "AWAIT_CONSENT": "Excellent! I have all the information I need. Before I process your application, I need your verbal consent. Could you please say 'I agree' or 'Yes, I consent' to proceed with the loan application?",
+}
+
+# Maps interview stages to the field they're collecting
+INTERVIEW_STAGE_FIELD_MAP = {
+    "AWAIT_NAME": "name",
+    "AWAIT_AGE": "age",
+    "AWAIT_EMPLOYMENT": "employment_type",
+    "AWAIT_INCOME": "monthly_income",
+    "AWAIT_LOAN_PURPOSE": "loan_purpose",
+    "AWAIT_AMOUNT": "requested_amount",
+}
+
+# Ordered interview flow
+INTERVIEW_FLOW = [
+    "INTERVIEW_GREETING",
+    "AWAIT_NAME",
+    "AWAIT_AGE",
+    "AWAIT_EMPLOYMENT",
+    "AWAIT_INCOME",
+    "AWAIT_LOAN_PURPOSE",
+    "AWAIT_AMOUNT",
+    "AWAIT_CONSENT",
+]
+
+
+# Valid transitions (updated with interview sub-states)
 VALID_TRANSITIONS = {
     PipelineStage.SESSION_INIT: [PipelineStage.METADATA_CAPTURE],
-    PipelineStage.METADATA_CAPTURE: [PipelineStage.STT_ACTIVE, PipelineStage.SESSION_FAILED],
+    PipelineStage.METADATA_CAPTURE: [PipelineStage.INTERVIEW_GREETING, PipelineStage.STT_ACTIVE, PipelineStage.SESSION_FAILED],
+    PipelineStage.INTERVIEW_GREETING: [PipelineStage.AWAIT_NAME],
+    PipelineStage.AWAIT_NAME: [PipelineStage.AWAIT_AGE, PipelineStage.AWAIT_NAME],
+    PipelineStage.AWAIT_AGE: [PipelineStage.AWAIT_EMPLOYMENT, PipelineStage.AWAIT_AGE],
+    PipelineStage.AWAIT_EMPLOYMENT: [PipelineStage.AWAIT_INCOME, PipelineStage.AWAIT_EMPLOYMENT],
+    PipelineStage.AWAIT_INCOME: [PipelineStage.AWAIT_LOAN_PURPOSE, PipelineStage.AWAIT_INCOME],
+    PipelineStage.AWAIT_LOAN_PURPOSE: [PipelineStage.AWAIT_AMOUNT, PipelineStage.AWAIT_LOAN_PURPOSE],
+    PipelineStage.AWAIT_AMOUNT: [PipelineStage.AWAIT_CONSENT, PipelineStage.AWAIT_AMOUNT],
+    PipelineStage.AWAIT_CONSENT: [PipelineStage.LIVENESS_CHECK, PipelineStage.AWAIT_CONSENT, PipelineStage.SESSION_FAILED],
     PipelineStage.STT_ACTIVE: [PipelineStage.FIELD_EXTRACTION, PipelineStage.SESSION_FAILED],
     PipelineStage.FIELD_EXTRACTION: [PipelineStage.CONSENT_CHECK, PipelineStage.STT_ACTIVE, PipelineStage.SESSION_FAILED],
     PipelineStage.CONSENT_CHECK: [PipelineStage.LIVENESS_CHECK, PipelineStage.SESSION_FAILED],
@@ -319,4 +376,181 @@ async def list_failure_modes():
             k: {**v, "stage": v["stage"].value}
             for k, v in FAILURE_MODES.items()
         }
+    }
+
+
+# ──────────────────────────────────────────────────────────────────
+# Interview Flow Endpoints
+# ──────────────────────────────────────────────────────────────────
+
+@router.post("/{session_id}/interview-next")
+async def interview_next(session_id: str):
+    """
+    Determine the next interview question based on which fields are still missing.
+    Advances the FSM to the appropriate interview sub-state.
+    Returns the next question for the AI to speak.
+    """
+    session = store.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    current = session.get("pipeline_stage", PipelineStage.SESSION_INIT.value)
+    fields = session.get("extracted_fields", {})
+    consent = session.get("consent")
+
+    # Check if consent was obtained — if so, interview is done
+    if consent and isinstance(consent, dict) and consent.get("is_consent"):
+        return {
+            "session_id": session_id,
+            "interview_complete": True,
+            "current_stage": current,
+            "message": "Interview complete. Consent obtained. Ready for pipeline processing.",
+            "next_action": "run_pipeline",
+        }
+
+    # Find the next missing field
+    next_stage = None
+    for stage_name in INTERVIEW_FLOW:
+        if stage_name == "INTERVIEW_GREETING":
+            # Skip greeting if we're past it
+            if current != PipelineStage.SESSION_INIT.value and current != PipelineStage.METADATA_CAPTURE.value and current != "INTERVIEW_GREETING":
+                continue
+            if current in (PipelineStage.SESSION_INIT.value, PipelineStage.METADATA_CAPTURE.value):
+                next_stage = stage_name
+                break
+            continue
+
+        if stage_name == "AWAIT_CONSENT":
+            # Only ask for consent if all data fields are collected
+            all_collected = True
+            for field_stage, field_name in INTERVIEW_STAGE_FIELD_MAP.items():
+                field_data = fields.get(field_name, {})
+                if isinstance(field_data, dict):
+                    val = field_data.get("value")
+                    conf = field_data.get("confidence", 0)
+                else:
+                    val = field_data
+                    conf = 1.0 if field_data else 0
+                if not val or conf < 0.3:
+                    all_collected = False
+                    break
+            if all_collected:
+                next_stage = "AWAIT_CONSENT"
+                break
+            continue
+
+        # Check if this field is missing or low confidence
+        field_name = INTERVIEW_STAGE_FIELD_MAP.get(stage_name)
+        if field_name:
+            field_data = fields.get(field_name, {})
+            if isinstance(field_data, dict):
+                val = field_data.get("value")
+                conf = field_data.get("confidence", 0)
+            else:
+                val = field_data
+                conf = 1.0 if field_data else 0
+
+            if not val or conf < 0.3:
+                next_stage = stage_name
+                break
+
+    if not next_stage:
+        # All fields collected, ask for consent
+        next_stage = "AWAIT_CONSENT"
+
+    # Format the question with dynamic field values
+    question_template = INTERVIEW_QUESTIONS.get(next_stage, "Could you tell me more?")
+    try:
+        name_val = ""
+        if isinstance(fields.get("name"), dict):
+            name_val = fields["name"].get("value", "")
+        elif isinstance(fields.get("name"), str):
+            name_val = fields["name"]
+        question = question_template.format(
+            name=name_val or "there",
+        )
+    except (KeyError, IndexError):
+        question = question_template
+
+    # Transition FSM
+    try:
+        stage_enum = PipelineStage(next_stage)
+        await _transition(session_id, stage_enum)
+    except (ValueError, Exception):
+        pass
+
+    # Calculate interview progress
+    current_step = INTERVIEW_FLOW.index(next_stage) + 1 if next_stage in INTERVIEW_FLOW else 0
+    total_steps = len(INTERVIEW_FLOW)
+
+    # Summarise collected fields
+    collected = {}
+    for field_name, field_data in fields.items():
+        if isinstance(field_data, dict) and field_data.get("value"):
+            collected[field_name] = {
+                "value": field_data["value"],
+                "confidence": field_data.get("confidence", 0),
+            }
+
+    await audit.emit(session_id, "INTERVIEW_QUESTION", next_stage, {
+        "question": question[:100],
+        "step": current_step,
+        "total_steps": total_steps,
+    })
+
+    return {
+        "session_id": session_id,
+        "interview_complete": False,
+        "current_stage": next_stage,
+        "question": question,
+        "step": current_step,
+        "total_steps": total_steps,
+        "expected_field": INTERVIEW_STAGE_FIELD_MAP.get(next_stage),
+        "collected_fields": collected,
+    }
+
+
+@router.get("/{session_id}/interview-status")
+async def interview_status(session_id: str):
+    """Get current interview progress — which fields are collected and their confidence."""
+    session = store.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    fields = session.get("extracted_fields", {})
+    consent = session.get("consent")
+
+    status_map = {}
+    for stage_name, field_name in INTERVIEW_STAGE_FIELD_MAP.items():
+        field_data = fields.get(field_name, {})
+        if isinstance(field_data, dict):
+            status_map[field_name] = {
+                "value": field_data.get("value"),
+                "confidence": field_data.get("confidence", 0),
+                "collected": bool(field_data.get("value")),
+                "stage": stage_name,
+            }
+        else:
+            status_map[field_name] = {
+                "value": field_data,
+                "confidence": 1.0 if field_data else 0,
+                "collected": bool(field_data),
+                "stage": stage_name,
+            }
+
+    collected_count = sum(1 for v in status_map.values() if v["collected"])
+    total_fields = len(status_map)
+    avg_confidence = (
+        sum(v["confidence"] for v in status_map.values() if v["collected"]) / collected_count
+        if collected_count > 0 else 0
+    )
+
+    return {
+        "session_id": session_id,
+        "fields": status_map,
+        "collected_count": collected_count,
+        "total_fields": total_fields,
+        "avg_confidence": round(avg_confidence, 3),
+        "consent_obtained": bool(consent and isinstance(consent, dict) and consent.get("is_consent")),
+        "interview_complete": collected_count >= total_fields and bool(consent and isinstance(consent, dict) and consent.get("is_consent")),
     }

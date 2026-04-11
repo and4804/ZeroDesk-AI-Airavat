@@ -332,7 +332,7 @@ test("T8: Negotiate returns 200", r.status_code == 200, f"Got {r.status_code}")
 neg = r.json()
 test("T8: Negotiation response text", bool(neg.get("response")))
 test("T8: Round tracking", neg.get("round") == 1)
-test("T8: Max rounds set", neg.get("max_rounds") == 3)
+test("T8: Unlimited rounds (no cap)", neg.get("max_rounds", 999) >= 999, f"Got max_rounds={neg.get('max_rounds')}")
 
 # 8c. Accept offer
 r = requests.post(f"{BASE}/api/offer/{SESSION_ID}/accept")

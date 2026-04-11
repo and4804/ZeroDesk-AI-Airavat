@@ -121,6 +121,18 @@ def _generate_offer(session: dict) -> dict:
     else:
         fraud_premium = 2.0
     
+    # Confidence metric — calculated but NOT applied to initial rate (only during negotiation)
+    avg_confidence = 0.0
+    confidence_count = 0
+    for field_data in fields.values():
+        if isinstance(field_data, dict) and field_data.get("value"):
+            avg_confidence += field_data.get("confidence", 0)
+            confidence_count += 1
+    avg_confidence = avg_confidence / confidence_count if confidence_count > 0 else 0
+    
+    # Confidence discount is NOT applied upfront — only used as leverage during negotiation
+    confidence_discount = 0.0
+    
     interest_rate = round(base_rate + risk_premium + score_premium + fraud_premium, 2)
     interest_rate = min(max(interest_rate, 9.0), 24.0)  # Cap between 9-24%
     
@@ -152,7 +164,10 @@ def _generate_offer(session: dict) -> dict:
             "risk_premium": risk_premium,
             "score_premium": score_premium,
             "fraud_premium": fraud_premium,
+            "confidence_discount": confidence_discount,
         },
+        "avg_confidence": round(avg_confidence, 3),
+        "confidence_discount": confidence_discount,
         "default_tenure_months": default_tenure,
         "default_emi": default_emi,
         "emi_table": emi_table,
@@ -166,28 +181,41 @@ def _generate_offer(session: dict) -> dict:
 # Negotiation Agent
 # ──────────────────────────────────────────────────────────────────
 
-NEGOTIATION_PROMPT = """You are a friendly but professional loan negotiation agent. You've presented a loan offer to the applicant.
+NEGOTIATION_PROMPT = """You are an expert, persuasive loan negotiation agent for a bank. You must convince the applicant to accept the current loan offer.
 
 Current offer:
-- Loan Amount: ₹{amount:,.0f}
+- Loan Amount: {amount}
 - Interest Rate: {rate}% p.a.
 - Tenure: {tenure} months
-- EMI: ₹{emi:,.0f}/month
+- EMI: {emi}/month
+- Credit Score: {credit_score}
+- Risk Profile: {risk_persona}
 
-The applicant has said: "{objection}"
+Original offer rate: {original_rate}%
+Minimum allowed rate: {min_rate}% (NEVER go below this)
 
-Negotiation round: {round}/{max_rounds}
+Negotiation round: {round_num}
+Previous negotiation history:
+{history}
 
-Rules:
-1. You can adjust the amount by ±20% from current offer (but never exceed original eligible amount)
-2. You can adjust tenure between 12-60 months
-3. You CANNOT lower the interest rate below {min_rate}%
-4. Be empathetic but firm on risk-based pricing
-5. If this is the final round, clearly state the final terms
+The applicant just said: "{objection}"
 
-Respond with a JSON object:
+STRATEGY (follow strictly based on round number):
+- Round 1: Acknowledge concern warmly. Offer a SMALL discount of 0.25% as a goodwill gesture. Say something like "I understand, let me see what I can do..."
+- Round 2: If they push again, offer another 0.25% discount (if still above min_rate). Explain why: mention their credit score, risk profile, and market benchmark rates.
+- Round 3+: DO NOT offer any more discounts. Instead, CONVINCE the user by:
+  * Explaining the rate is already competitive for their credit profile (credit score {credit_score})
+  * Comparing to market rates (typical personal loan: 12-24%, home loan: 8.5-12%)
+  * Highlighting the benefit of the loan (achieving their goal)
+  * Offering flexible tenure instead (longer tenure = lower EMI)
+  * Mentioning they can refinance later when credit score improves
+  * Being empathetic but firm
+
+IMPORTANT: Keep responses SHORT (2-3 sentences max). Be conversational, not robotic. Never repeat the same argument twice.
+
+Respond ONLY with valid JSON:
 {{
-  "response_text": "Your conversational response to the applicant (2-3 sentences)",
+  "response_text": "Your conversational response (2-3 sentences)",
   "adjusted_offer": {{
     "amount": {amount},
     "rate": {rate},
@@ -198,20 +226,41 @@ Respond with a JSON object:
 }}"""
 
 
-async def _negotiate(offer: dict, objection: str, round_num: int, max_rounds: int = 3) -> dict:
-    """LLM-powered negotiation micro-agent."""
+async def _negotiate(offer: dict, objection: str, round_num: int, max_rounds: int = 999) -> dict:
+    """LLM-powered negotiation micro-agent with 3-phase strategy."""
+    
+    original_rate = offer.get("rate_breakdown", {}).get("base_rate", offer["interest_rate"])
+    min_rate = max(original_rate - 1.0, 9.0)  # Can only discount up to 1% total
+    credit_score = offer.get("credit_score", 650)
+    risk_persona = offer.get("risk_persona", "moderate_borrower")
+    
+    # Build history from negotiation log
+    history_lines = []
+    for entry in offer.get("negotiation_log", []):
+        history_lines.append(f"  Round {entry.get('round', '?')}: User said: \"{entry.get('objection', '')}\" → AI responded: \"{entry.get('response', '')[:100]}...\"")
+    history = "\n".join(history_lines) if history_lines else "  (First negotiation round)"
+    
     if not settings.has_groq_key:
         # Mock negotiation
-        return {
-            "response_text": f"I understand your concern. Let me see what I can do for you. Based on your profile, I can offer you a slightly adjusted tenure. This is round {round_num} of {max_rounds}.",
-            "adjusted_offer": {
-                "amount": offer["eligible_amount"],
-                "rate": offer["interest_rate"],
-                "tenure": 48 if round_num == 1 else offer["default_tenure_months"],
-                "emi": _calculate_emi(offer["eligible_amount"], offer["interest_rate"], 48 if round_num == 1 else offer["default_tenure_months"]),
-            },
-            "is_final": round_num >= max_rounds,
-        }
+        if round_num == 1:
+            new_rate = max(offer["interest_rate"] - 0.25, min_rate)
+            new_emi = _calculate_emi(offer["eligible_amount"], new_rate, offer["default_tenure_months"])
+            return {
+                "response_text": f"I understand your concern. Let me see what I can do — I can bring your rate down to {new_rate}%. That would make your EMI ₹{new_emi:,.0f}. Shall we proceed with this?",
+                "adjusted_offer": {
+                    "amount": offer["eligible_amount"],
+                    "rate": new_rate,
+                    "tenure": offer["default_tenure_months"],
+                    "emi": new_emi,
+                },
+                "is_final": False,
+            }
+        else:
+            return {
+                "response_text": f"I've already given you the best possible rate for your credit profile. This is genuinely competitive compared to market rates of 14-18% for similar profiles. Shall I extend the tenure to reduce your EMI instead?",
+                "adjusted_offer": None,
+                "is_final": False,
+            }
     
     try:
         from groq import Groq
@@ -222,28 +271,51 @@ async def _negotiate(offer: dict, objection: str, round_num: int, max_rounds: in
             rate=offer["interest_rate"],
             tenure=offer["default_tenure_months"],
             emi=offer["default_emi"],
+            credit_score=credit_score,
+            risk_persona=risk_persona,
+            original_rate=original_rate,
+            min_rate=min_rate,
             objection=objection,
-            round=round_num,
-            max_rounds=max_rounds,
-            min_rate=offer["interest_rate"] - 0.5,
+            round_num=round_num,
+            history=history,
         )
         
         response = client.chat.completions.create(
             model=settings.GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.5,
+            temperature=0.6,
             max_tokens=512,
         )
         
         raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
         
-        result = json.loads(raw)
+        result = None
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            import re
+            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if json_match:
+                try:
+                    result = json.loads(json_match.group())
+                except json.JSONDecodeError:
+                    pass
+        
+        if not result:
+            result = {
+                "response_text": raw.split('{')[0].strip() or "I understand your concern. This rate reflects your current credit profile, and I've already applied the best terms I can offer.",
+                "adjusted_offer": None,
+                "is_final": False,
+            }
         
         # Recalculate EMI for adjusted offer
-        adj = result.get("adjusted_offer", {})
-        if adj:
+        adj = result.get("adjusted_offer")
+        if adj and isinstance(adj, dict):
+            # Enforce min rate
+            if adj.get("rate", 999) < min_rate:
+                adj["rate"] = min_rate
             adj["emi"] = _calculate_emi(
                 adj.get("amount", offer["eligible_amount"]),
                 adj.get("rate", offer["interest_rate"]),
@@ -253,9 +325,9 @@ async def _negotiate(offer: dict, objection: str, round_num: int, max_rounds: in
         return result
     except Exception as e:
         return {
-            "response_text": f"I appreciate your feedback. Let me review the terms once more.",
+            "response_text": "I appreciate your feedback. Let me review the terms once more.",
             "adjusted_offer": None,
-            "is_final": round_num >= max_rounds,
+            "is_final": False,
             "error": str(e),
         }
 
@@ -320,67 +392,81 @@ class NegotiationRequest(BaseModel):
 
 @router.post("/{session_id}/negotiate")
 async def negotiate_offer(session_id: str, req: NegotiationRequest):
-    """Handle applicant objection via LLM negotiation agent (max 3 rounds)."""
-    session = store.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    offer = session.get("offer")
-    if not offer:
-        raise HTTPException(status_code=400, detail="No offer generated yet")
-    
-    max_rounds = 3
-    current_round = offer.get("negotiation_rounds", 0) + 1
-    
-    if current_round > max_rounds:
+    """Handle applicant objection via LLM negotiation agent."""
+    try:
+        session = store.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        offer = session.get("offer")
+        if not offer:
+            raise HTTPException(status_code=400, detail="No offer generated yet")
+        
+        current_round = offer.get("negotiation_rounds", 0) + 1
+        
+        result = await _negotiate(offer, req.objection, current_round, max_rounds=999)
+        
+        # Update offer with negotiation
+        negotiation_log = offer.get("negotiation_log", [])
+        negotiation_log.append({
+            "round": current_round,
+            "objection": req.objection,
+            "response": result.get("response_text"),
+            "adjusted_offer": result.get("adjusted_offer"),
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+        
+        updated_offer = {**offer}
+        if result.get("adjusted_offer"):
+            adj = result["adjusted_offer"]
+            updated_offer["eligible_amount"] = adj.get("amount", offer["eligible_amount"])
+            updated_offer["interest_rate"] = adj.get("rate", offer["interest_rate"])
+            updated_offer["default_tenure_months"] = adj.get("tenure", offer["default_tenure_months"])
+            updated_offer["default_emi"] = adj.get("emi", offer["default_emi"])
+            
+            # Regenerate EMI table with updated rate/amount
+            new_amount = updated_offer["eligible_amount"]
+            new_rate = updated_offer["interest_rate"]
+            tenures = [12, 24, 36, 48, 60]
+            emi_table = []
+            for months in tenures:
+                emi = _calculate_emi(new_amount, new_rate, months)
+                total_payment = emi * months
+                total_interest = total_payment - new_amount
+                emi_table.append({
+                    "tenure_months": months,
+                    "emi": round(emi, 2),
+                    "total_payment": round(total_payment, 2),
+                    "total_interest": round(total_interest, 2),
+                })
+            updated_offer["emi_table"] = emi_table
+        
+        updated_offer["negotiation_rounds"] = current_round
+        updated_offer["negotiation_log"] = negotiation_log
+        
+        store.update(session_id, {"offer": updated_offer})
+        
+        await audit.emit(session_id, "OFFER_NEGOTIATED", "OFFER", {
+            "round": current_round,
+            "objection": req.objection[:100],
+            "adjusted": result.get("adjusted_offer") is not None,
+        })
+        
         return {
             "session_id": session_id,
-            "message": "Maximum negotiation rounds reached. Please accept or decline the current offer.",
-            "current_offer": offer,
-            "round": current_round - 1,
-            "max_rounds": max_rounds,
+            "response": result.get("response_text"),
+            "adjusted_offer": result.get("adjusted_offer"),
+            "round": current_round,
+            "max_rounds": 999,
+            "is_final": result.get("is_final", False),
+            "current_offer": updated_offer,
         }
-    
-    result = await _negotiate(offer, req.objection, current_round, max_rounds)
-    
-    # Update offer with negotiation
-    negotiation_log = offer.get("negotiation_log", [])
-    negotiation_log.append({
-        "round": current_round,
-        "objection": req.objection,
-        "response": result.get("response_text"),
-        "adjusted_offer": result.get("adjusted_offer"),
-        "timestamp": datetime.utcnow().isoformat(),
-    })
-    
-    updated_offer = {**offer}
-    if result.get("adjusted_offer"):
-        adj = result["adjusted_offer"]
-        updated_offer["eligible_amount"] = adj.get("amount", offer["eligible_amount"])
-        updated_offer["interest_rate"] = adj.get("rate", offer["interest_rate"])
-        updated_offer["default_tenure_months"] = adj.get("tenure", offer["default_tenure_months"])
-        updated_offer["default_emi"] = adj.get("emi", offer["default_emi"])
-    
-    updated_offer["negotiation_rounds"] = current_round
-    updated_offer["negotiation_log"] = negotiation_log
-    
-    store.update(session_id, {"offer": updated_offer})
-    
-    await audit.emit(session_id, "OFFER_NEGOTIATED", "OFFER", {
-        "round": current_round,
-        "objection": req.objection[:100],
-        "adjusted": result.get("adjusted_offer") is not None,
-    })
-    
-    return {
-        "session_id": session_id,
-        "response": result.get("response_text"),
-        "adjusted_offer": result.get("adjusted_offer"),
-        "round": current_round,
-        "max_rounds": max_rounds,
-        "is_final": result.get("is_final", False),
-        "current_offer": updated_offer,
-    }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/{session_id}/accept")

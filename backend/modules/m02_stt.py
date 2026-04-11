@@ -56,58 +56,91 @@ async def _extract_fields_llm(transcript: str, session_id: str) -> dict:
             "model": "mock",
         }
     
-    try:
-        from groq import Groq
-        client = Groq(api_key=settings.GROQ_API_KEY)
-        
-        prompt = f"""You are a data extraction agent for a loan application. 
+    import re
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            from groq import Groq
+            client = Groq(api_key=settings.GROQ_API_KEY)
+            
+            prompt = f"""You are a data extraction agent for a loan application. 
 Extract the following fields from this conversation transcript. 
 For each field, provide the extracted value and a confidence score (0.0 to 1.0).
-If a field is not mentioned, set value to null and confidence to 0.0.
+
+Confidence scoring rules:
+- 0.9-1.0: The value was explicitly and clearly stated by the applicant
+- 0.7-0.89: The value was mentioned but somewhat ambiguous (e.g. "around 50K")
+- 0.5-0.69: The value was inferred from context, not directly stated
+- 0.0-0.49: The value is a guess or not mentioned at all
+- If a field is not mentioned at all, set value to null and confidence to 0.0
 
 Fields to extract:
 - name: Full name of the applicant
 - age: Age of the applicant (number)
 - employment_type: Type of employment (salaried/self-employed/business/unemployed)
-- monthly_income: Monthly income in INR (number only)
+- monthly_income: Monthly income in INR (number only, no commas or currency symbols)
 - loan_purpose: Purpose of the loan
-- requested_amount: Requested loan amount in INR (number only)
+- requested_amount: Requested loan amount in INR (number only, no commas or currency symbols)
 - city: City of residence
 - employer_name: Name of employer (if salaried)
 
 Transcript:
 \"\"\"{transcript}\"\"\"
 
-Respond ONLY with valid JSON in this exact format:
+Respond ONLY with valid JSON in this exact format, with NO trailing commas and NO markdown wrappers:
 {{
-  "name": {{"value": "...", "confidence": 0.9}},
-  "age": {{"value": "30", "confidence": 0.8}},
-  "employment_type": {{"value": "salaried", "confidence": 0.9}},
-  "monthly_income": {{"value": "50000", "confidence": 0.7}},
-  "loan_purpose": {{"value": "...", "confidence": 0.8}},
-  "requested_amount": {{"value": "500000", "confidence": 0.85}},
-  "city": {{"value": "...", "confidence": 0.6}},
-  "employer_name": {{"value": "...", "confidence": 0.5}}
+  "name": {{"value": "extracted name or null", "confidence": 0.0}},
+  "age": {{"value": "extracted age or null", "confidence": 0.0}},
+  "employment_type": {{"value": "extracted type or null", "confidence": 0.0}},
+  "monthly_income": {{"value": "extracted income or null", "confidence": 0.0}},
+  "loan_purpose": {{"value": "extracted purpose or null", "confidence": 0.0}},
+  "requested_amount": {{"value": "extracted amount or null", "confidence": 0.0}},
+  "city": {{"value": "extracted city or null", "confidence": 0.0}},
+  "employer_name": {{"value": "extracted employer or null", "confidence": 0.0}}
 }}"""
 
-        response = client.chat.completions.create(
-            model=settings.GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=512,
-        )
-        
-        raw = response.choices[0].message.content.strip()
-        # Strip markdown code fences if present
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
-        
-        fields = json.loads(raw)
-        return {"fields": fields, "model": settings.GROQ_MODEL}
-        
-    except Exception as e:
-        print(f"[WARN] LLM extraction failed: {e}")
-        return {"fields": {}, "model": "error", "error": str(e)}
+            response = client.chat.completions.create(
+                model=settings.GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1 + (0.2 * attempt), # Increase temperature slightly on retries
+                max_tokens=512,
+            )
+            
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+                
+            fields = {}
+            # Strategy 1: Direct JSON parse
+            try:
+                fields = json.loads(raw)
+            except json.JSONDecodeError:
+                pass
+                
+            # Strategy 2: Find JSON object matching exact regex
+            if not fields:
+                json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+                if json_match:
+                    clean_raw = json_match.group()
+                    # Strip common Llama 3 trailing commas right before closing brace
+                    clean_raw = re.sub(r',\s*\}', '}', clean_raw)
+                    try:
+                        fields = json.loads(clean_raw)
+                    except json.JSONDecodeError:
+                        pass
+
+            if fields:
+                return {"fields": fields, "model": settings.GROQ_MODEL}
+            else:
+                print(f"[WARN] Failed to parse JSON from LLM on attempt {attempt + 1}: {raw}")
+                
+        except Exception as e:
+            print(f"[WARN] LLM extraction failed on attempt {attempt + 1}: {e}")
+            
+    # If all retries fail
+    print("[ERROR] Max retries exhausted for LLM extraction.")
+    return {"fields": {}, "model": "error", "error": "json parse failed after retries"}
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -276,11 +309,50 @@ async def extract_fields(session_id: str):
     if not transcript:
         raise HTTPException(status_code=404, detail="No transcript found")
     
-    result = await _extract_fields_llm(transcript, session_id)
+    # Clean transcript for better LLM extraction:
+    # Convert "[AI Question: X] answer" into "AI: X\nApplicant: answer" format
+    import re
+    clean = transcript
+    # Replace [AI Question: ...] markers with clear labels
+    clean = re.sub(r'\[AI Question:\s*', '\nAI: ', clean)
+    clean = clean.replace(']', '\nApplicant: ')
+    # Remove consecutive "Applicant:" labels without content
+    clean = re.sub(r'Applicant:\s*\n', '\n', clean)
+    # Clean up extra whitespace
+    clean = re.sub(r'\n{2,}', '\n', clean).strip()
     
-    # Store extracted fields
+    result = await _extract_fields_llm(clean, session_id)
+    
+    # Store extracted fields — MERGE with existing, keep higher confidence
     if result.get("fields"):
-        store.update(session_id, {"extracted_fields": result["fields"]})
+        session = store.get(session_id)
+        existing = session.get("extracted_fields", {}) if session else {}
+        merged = dict(existing)  # start from existing
+
+        for field_name, new_data in result["fields"].items():
+            old_data = existing.get(field_name, {})
+            # Normalise both to dicts
+            if not isinstance(new_data, dict):
+                new_data = {"value": new_data, "confidence": 1.0 if new_data else 0}
+            if not isinstance(old_data, dict):
+                old_data = {"value": old_data, "confidence": 1.0 if old_data else 0}
+
+            new_val = new_data.get("value")
+            new_conf = new_data.get("confidence", 0)
+            old_val = old_data.get("value")
+            old_conf = old_data.get("confidence", 0)
+
+            # Keep new value only if it actually has content AND beats old confidence,
+            # or if old value was empty
+            if new_val and (not old_val or new_conf >= old_conf):
+                merged[field_name] = new_data
+            elif old_val:
+                merged[field_name] = old_data
+            else:
+                merged[field_name] = new_data  # both empty, take new
+
+        result["fields"] = merged
+        store.update(session_id, {"extracted_fields": merged})
         
         db = await get_db()
         try:

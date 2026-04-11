@@ -4,11 +4,7 @@ import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { createSession } from '@/lib/api';
 
-const DEMO_PERSONAS = [
-  { name: 'Priya Sharma', id: 'PRIYA001', desc: 'Good credit (740) • Low risk • Expected: APPROVED', color: 'emerald' },
-  { name: 'Rohit Mehta', id: 'ROHIT001', desc: 'Bad credit (420) • High risk • Expected: REJECTED', color: 'rose' },
-  { name: 'Meera Patil', id: 'MEERA001', desc: 'Borderline (620) • Medium risk • Expected: REFER', color: 'amber' },
-];
+
 
 export default function HomePage() {
   const router = useRouter();
@@ -41,9 +37,9 @@ export default function HomePage() {
             key={i}
             className="particle"
             style={{
-              left: `${Math.random() * 100}%`,
-              animationDelay: `${Math.random() * 8}s`,
-              animationDuration: `${6 + Math.random() * 6}s`,
+              left: `${((i * 37 + 13) % 100)}%`,
+              animationDelay: `${(i * 1.3) % 8}s`,
+              animationDuration: `${6 + (i * 0.7) % 6}s`,
             }}
           />
         ))}
@@ -80,49 +76,7 @@ export default function HomePage() {
           ))}
         </div>
 
-        {/* Demo Personas */}
-        <section className="mb-12">
-          <h2 className="text-center text-lg font-semibold text-slate-300 mb-6 slide-up" style={{ animationDelay: '0.2s' }}>
-            Start a Demo Session
-          </h2>
-          <div className="grid md:grid-cols-3 gap-6">
-            {DEMO_PERSONAS.map((persona, i) => (
-              <div
-                key={persona.id}
-                className="glass-card glow p-6 slide-up cursor-pointer hover:border-indigo-500/40 transition-all duration-300"
-                style={{ animationDelay: `${0.3 + i * 0.1}s` }}
-              >
-                <div className="flex items-center gap-3 mb-3">
-                  <div className={`w-10 h-10 rounded-full flex items-center justify-center text-lg font-bold ${
-                    persona.color === 'emerald' ? 'bg-emerald-500/20 text-emerald-400' :
-                    persona.color === 'rose' ? 'bg-rose-500/20 text-rose-400' :
-                    'bg-amber-500/20 text-amber-400'
-                  }`}>
-                    {persona.name.charAt(0)}
-                  </div>
-                  <div>
-                    <h3 className="font-semibold text-white">{persona.name}</h3>
-                    <p className="text-xs text-slate-500">{persona.id}</p>
-                  </div>
-                </div>
-                <p className="text-sm text-slate-400 mb-4">{persona.desc}</p>
-                <button
-                  onClick={() => handleStart(persona.name, persona.id)}
-                  disabled={loading !== null}
-                  className="btn-primary w-full text-sm"
-                >
-                  {loading === persona.id ? (
-                    <span className="flex items-center justify-center gap-2">
-                      <span className="spinner !w-4 !h-4" /> Starting...
-                    </span>
-                  ) : (
-                    `Start as ${persona.name.split(' ')[0]}`
-                  )}
-                </button>
-              </div>
-            ))}
-          </div>
-        </section>
+
 
         {/* Custom applicant */}
         <section className="glass-card glow max-w-md mx-auto p-6 mb-12 slide-up" style={{ animationDelay: '0.6s' }}>

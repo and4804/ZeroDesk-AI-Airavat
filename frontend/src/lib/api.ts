@@ -141,9 +141,27 @@ export async function getAnalytics() {
   return apiCall('/api/compliance/analytics');
 }
 
+// Interview Flow
+export async function interviewNext(sessionId: string) {
+  return apiCall(`/api/orchestrator/${sessionId}/interview-next`, { method: 'POST' });
+}
+
+export async function interviewStatus(sessionId: string) {
+  return apiCall(`/api/orchestrator/${sessionId}/interview-status`);
+}
+
+// Free-Form Chat
+export async function chatWithAI(sessionId: string, message: string, currentStage?: string) {
+  return apiCall(`/api/llm/${sessionId}/chat`, {
+    method: 'POST',
+    body: JSON.stringify({ message, current_stage: currentStage }),
+  });
+}
+
 // STT WebSocket
 export function createSTTWebSocket(sessionId: string): WebSocket {
   return new WebSocket(`${WS_BASE}/api/stt/ws/${sessionId}`);
 }
 
 export { API_BASE, WS_BASE };
+

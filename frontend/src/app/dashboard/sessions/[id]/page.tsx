@@ -390,7 +390,7 @@ export default function SessionDetailPage() {
                   {offer.status as string}
                 </span>
                 <span className="text-xs text-slate-500">Rounds: {offer.negotiation_rounds as number}</span>
-                {offer.accepted_at && <span className="text-xs text-slate-500">Accepted: {offer.accepted_at as string}</span>}
+                {Boolean(offer.accepted_at) && <span className="text-xs text-slate-500">Accepted: {String(offer.accepted_at)}</span>}
               </div>
             </div>
           ) : (

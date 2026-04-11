@@ -21,7 +21,7 @@ groq==0.25.0
 
 # Vision
 mediapipe==0.10.21
-deepface==0.0.93
+onnxruntime==1.21.0
 opencv-python-headless==4.11.0.86
 numpy<2
 

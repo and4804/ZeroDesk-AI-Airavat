@@ -4,6 +4,7 @@ Uses Groq LLM with structured chain-of-thought reasoning.
 """
 
 import json
+import re
 from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -116,9 +117,24 @@ async def _run_llm_analysis(transcript: str, fields: dict) -> dict:
         
         raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
         
-        result = json.loads(raw)
+        result = {}
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            import re
+            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if json_match:
+                try:
+                    result = json.loads(json_match.group())
+                except json.JSONDecodeError:
+                    pass
+
+        if not result:
+            print(f"[WARN] Failed to parse JSON from LLM: {raw}")
+            return {"error": "json parse failed", "model": settings.GROQ_MODEL}
+            
         result["model"] = settings.GROQ_MODEL
         return result
         
@@ -266,3 +282,221 @@ async def get_assessment(session_id: str):
         await db.close()
     
     raise HTTPException(status_code=404, detail="No assessment found")
+
+
+# ──────────────────────────────────────────────────────────────────
+# Free-Form Conversational Chat
+# ──────────────────────────────────────────────────────────────────
+
+CHAT_SYSTEM_PROMPT = """You are a friendly, professional AI loan advisor conducting a voice-based video call with a loan applicant.
+
+Current session context:
+- Interview stage: {stage}
+- Collected fields so far: {fields_summary}
+- Consent status: {consent_status}
+- Offer status: {offer_status}
+
+Rules:
+1. Answer the user's question naturally and helpfully, like a real loan officer would.
+2. You can answer about loans, EMIs, interest rates, banking concepts, eligibility, or even general questions.
+3. Keep responses conversational and concise (2-4 sentences max) since this is a voice call.
+4. If the user's message contains personal information (name, age, income, etc.), extract it naturally.
+5. After answering, gently guide back to the interview if there are uncollected fields.
+6. If the user says something like "I accept", "sounds good", "I agree", "yes I consent" — recognize it as acceptance/consent.
+7. Be warm and empathetic but professional.
+
+Respond with JSON:
+{{
+  "response": "Your conversational response (2-4 sentences, natural spoken language)",
+  "extracted_data": {{
+    "name": null,
+    "age": null,
+    "employment_type": null,
+    "monthly_income": null,
+    "loan_purpose": null,
+    "requested_amount": null,
+    "city": null
+  }},
+  "intent": "general_chat|answer_question|provide_info|accept_offer|give_consent|negotiate|decline",
+  "should_advance_interview": false
+}}
+
+Only fill extracted_data fields if the user explicitly mentions them. Leave as null otherwise.
+Set should_advance_interview to true if the user provided data for the currently expected field."""
+
+
+class ChatRequest(BaseModel):
+    message: str
+    current_stage: Optional[str] = None
+
+
+@router.post("/{session_id}/chat")
+async def chat(session_id: str, req: ChatRequest):
+    """
+    Free-form conversational endpoint. The AI answers ANY question the user has,
+    while staying in character as a loan advisor. Works at any pipeline stage.
+    Also extracts data if the user mentions relevant info in passing.
+    """
+    session = store.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    fields = session.get("extracted_fields", {})
+    consent = session.get("consent")
+    offer = session.get("offer")
+    stage = req.current_stage or session.get("pipeline_stage", "INTERVIEW_GREETING")
+
+    # Build fields summary
+    fields_summary = []
+    for k, v in fields.items():
+        if isinstance(v, dict) and v.get("value"):
+            fields_summary.append(f"{k}: {v['value']} ({v.get('confidence', 0):.0%} confidence)")
+    fields_str = ", ".join(fields_summary) if fields_summary else "None collected yet"
+
+    consent_status = "Obtained" if (consent and isinstance(consent, dict) and consent.get("is_consent")) else "Not yet"
+    
+    offer_status = "No offer generated"
+    if offer:
+        status = offer.get("status", "generated")
+        if status == "accepted":
+            offer_status = "Offer accepted"
+        elif status == "declined":
+            offer_status = "Offer declined"
+        else:
+            offer_status = f"Offer: ₹{offer.get('eligible_amount', 0):,.0f} at {offer.get('interest_rate', 0)}%"
+
+    if not settings.has_groq_key:
+        # Mock response
+        response_text = f"That's a great question! Let me help you with that. As your AI loan advisor, I'm here to assist you with anything related to your loan application."
+        
+        # Check for acceptance/consent patterns
+        msg_lower = req.message.lower()
+        intent = "general_chat"
+        if any(p in msg_lower for p in ["i accept", "sounds good", "that works", "i'll take it", "deal"]):
+            intent = "accept_offer"
+            response_text = "Wonderful! I'll process your acceptance right away."
+        elif any(p in msg_lower for p in ["i agree", "i consent", "yes i consent", "go ahead"]):
+            intent = "give_consent"
+            response_text = "Thank you for your consent. I've recorded that. Let me proceed with your application."
+        elif any(p in msg_lower for p in ["lower", "reduce", "discount", "less", "negotiate", "cheaper"]):
+            intent = "negotiate"
+            response_text = "I understand you'd like better terms. Let me see what I can adjust for you."
+        
+        return {
+            "session_id": session_id,
+            "response": response_text,
+            "intent": intent,
+            "extracted_data": {},
+            "should_advance_interview": False,
+            "model": "mock",
+        }
+
+    try:
+        from groq import Groq
+        client = Groq(api_key=settings.GROQ_API_KEY)
+
+        system = CHAT_SYSTEM_PROMPT.format(
+            stage=stage,
+            fields_summary=fields_str,
+            consent_status=consent_status,
+            offer_status=offer_status,
+        )
+
+        response = client.chat.completions.create(
+            model=settings.GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": req.message},
+            ],
+            temperature=0.6,
+            max_tokens=512,
+        )
+
+        raw = response.choices[0].message.content.strip()
+        # Strip markdown code fences
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        
+        result = None
+        
+        # Strategy 1: Direct JSON parse
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+        
+        # Strategy 2: Find JSON object in the text (LLM sometimes wraps it in text)
+        if not result:
+            import re
+            json_match = re.search(r'\{[^{}]*"response"[^{}]*\}', raw, re.DOTALL)
+            if json_match:
+                try:
+                    result = json.loads(json_match.group())
+                except json.JSONDecodeError:
+                    pass
+        
+        # Strategy 3: Find nested JSON (with nested objects like extracted_data)
+        if not result:
+            brace_start = raw.find('{')
+            if brace_start >= 0:
+                # Find matching closing brace
+                depth = 0
+                for i in range(brace_start, len(raw)):
+                    if raw[i] == '{': depth += 1
+                    elif raw[i] == '}': depth -= 1
+                    if depth == 0:
+                        try:
+                            result = json.loads(raw[brace_start:i+1])
+                        except json.JSONDecodeError:
+                            pass
+                        break
+
+        # Strategy 4: Plain text fallback — clean it up
+        if not result:
+            # Remove any partial JSON that leaked
+            clean = re.sub(r'\{[^}]*"response".*', '', raw).strip() if 'import re' or True else raw
+            clean = re.sub(r'\{.*\}', '', raw, flags=re.DOTALL).strip()
+            if not clean:
+                clean = raw.split('{')[0].strip()  # Take text before first JSON
+            if not clean:
+                clean = "I understand. Let me help you with that."
+            result = {
+                "response": clean,
+                "extracted_data": {},
+                "intent": "general_chat",
+                "should_advance_interview": False,
+            }
+
+        # Update extracted fields if LLM found new data
+        extracted = result.get("extracted_data", {})
+        if extracted and any(v is not None for v in extracted.values()):
+            for field_name, value in extracted.items():
+                if value is not None:
+                    fields[field_name] = {"value": str(value), "confidence": 0.75}
+            store.update(session_id, {"extracted_fields": fields})
+
+        await audit.emit(session_id, "CHAT_MESSAGE", stage, {
+            "user_message": req.message[:200],
+            "intent": result.get("intent", "general_chat"),
+            "extracted_fields": [k for k, v in extracted.items() if v is not None] if extracted else [],
+        })
+
+        return {
+            "session_id": session_id,
+            "response": result.get("response", "I understand. How can I help you further?"),
+            "intent": result.get("intent", "general_chat"),
+            "extracted_data": extracted,
+            "should_advance_interview": result.get("should_advance_interview", False),
+            "model": settings.GROQ_MODEL,
+        }
+
+    except Exception as e:
+        print(f"[WARN] Chat failed: {e}")
+        return {
+            "session_id": session_id,
+            "response": "I understand your question. Let me help you with that. Could you tell me more?",
+            "intent": "general_chat",
+            "extracted_data": {},
+            "should_advance_interview": False,
+            "error": str(e),
+        }
