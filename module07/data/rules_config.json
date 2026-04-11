@@ -1,0 +1,74 @@
+[
+  {
+    "rule_id": "R01",
+    "rule_name": "Minimum Credit Score",
+    "field": "credit_score",
+    "operator": ">=",
+    "threshold": 650,
+    "action_on_fail": "REJECT",
+    "description": "Applicant credit score must be at least 650"
+  },
+  {
+    "rule_id": "R02",
+    "rule_name": "No Write-Offs",
+    "field": "written_off_accounts",
+    "operator": "==",
+    "threshold": 0,
+    "action_on_fail": "REJECT",
+    "description": "Applicant must have zero written-off accounts"
+  },
+  {
+    "rule_id": "R03",
+    "rule_name": "FOIR Limit",
+    "field": "foir",
+    "operator": "<=",
+    "threshold": 0.50,
+    "action_on_fail": "REJECT",
+    "description": "Fixed Obligation to Income Ratio must not exceed 50%"
+  },
+  {
+    "rule_id": "R04",
+    "rule_name": "No Recent DPD",
+    "field": "dpd_last_12m",
+    "operator": "==",
+    "threshold": null,
+    "action_on_fail": "REFER",
+    "description": "No Days Past Due events in the last 12 months"
+  },
+  {
+    "rule_id": "R05",
+    "rule_name": "Active Loan Cap",
+    "field": "active_loan_count",
+    "operator": "<=",
+    "threshold": 4,
+    "action_on_fail": "REFER",
+    "description": "Active loan count must not exceed 4"
+  },
+  {
+    "rule_id": "R06",
+    "rule_name": "Fraud Score Check",
+    "field": "fraud_score",
+    "operator": "<=",
+    "threshold": 60,
+    "action_on_fail": "REJECT",
+    "description": "Fraud score from M06 must not exceed 60"
+  },
+  {
+    "rule_id": "R07",
+    "rule_name": "Liveness Verification",
+    "field": "liveness_avg",
+    "operator": ">=",
+    "threshold": 0.6,
+    "action_on_fail": "REJECT",
+    "description": "Average liveness score from M04 must be at least 0.6"
+  },
+  {
+    "rule_id": "R08",
+    "rule_name": "Consent Verification",
+    "field": "consent_detected",
+    "operator": "==",
+    "threshold": true,
+    "action_on_fail": "HALT",
+    "description": "Verbal consent must be detected from M03"
+  }
+]
