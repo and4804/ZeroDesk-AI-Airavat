@@ -5,10 +5,13 @@ Multi-signal algorithmic fraud scoring (NOT just LLM-based).
 """
 
 import json
+import os
+import hashlib
 from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
+import httpx
 
 from config import settings
 from database import get_db
@@ -31,9 +34,210 @@ SIGNAL_WEIGHTS = {
 }
 
 
+HTTP_TIMEOUT_SECONDS = 6.0
+MAX_DEVICE_API_ERRORS = 2
+
+
+def _resolve_client_ip(session: dict) -> str:
+    """Best-effort client IP extraction from session."""
+    ip = (session.get("ip_address") or "").strip()
+    if not ip:
+        return "unknown"
+    if "," in ip:
+        ip = ip.split(",")[0].strip()
+    return ip
+
+
+def _safe_hash(value: str) -> str:
+    """Hash raw identifiers before sending to external verifiers."""
+    if not value:
+        return ""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+async def _call_json_api(
+    method: str,
+    url: str,
+    *,
+    params: Optional[dict] = None,
+    json_payload: Optional[dict] = None,
+    headers: Optional[dict] = None,
+) -> dict:
+    """HTTP helper with strict timeout and empty dict fallback."""
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+            resp = await client.request(method, url, params=params, json=json_payload, headers=headers)
+        if resp.status_code >= 400:
+            return {}
+        return resp.json() if resp.content else {}
+    except Exception:
+        return {}
+
+
+async def _verify_geolocation(ip: str, fallback_geo: dict) -> dict:
+    """
+    Verify geolocation with primary API.
+    Primary source defaults to settings.GEOIP_API_URL (same contract as ip-api).
+    """
+    if ip in ("unknown", "", "127.0.0.1", "::1", "localhost"):
+        return {"verified": False, "source": "local", "data": fallback_geo or {}}
+
+    geo_url = os.getenv("FRAUD_GEO_VERIFY_URL", settings.GEOIP_API_URL).rstrip("/")
+    data = await _call_json_api("GET", f"{geo_url}/{ip}")
+
+    if not data:
+        return {"verified": False, "source": "geo_fallback", "data": fallback_geo or {}}
+
+    normalized = {
+        "city": data.get("city") or data.get("regionName") or "Unknown",
+        "region": data.get("regionName", "Unknown"),
+        "country": data.get("country", "Unknown"),
+        "lat": data.get("lat", 0),
+        "lon": data.get("lon", 0),
+        "isp": data.get("isp", "Unknown"),
+        "is_proxy": data.get("proxy", False),
+        "is_hosting": data.get("hosting", False),
+    }
+    return {"verified": True, "source": "geo_api", "data": normalized}
+
+
+async def _verify_vpn_proxy(ip: str, geo_data: dict) -> dict:
+    """
+    VPN/proxy verification.
+    Uses IPQualityScore when key exists, else falls back to geolocation proxy flags.
+    """
+    if ip in ("unknown", "", "127.0.0.1", "::1", "localhost"):
+        return {"verified": False, "source": "local", "is_vpn": False, "is_proxy": False, "risk_score": 0}
+
+    key = os.getenv("IPQUALITYSCORE_API_KEY", "").strip()
+    if key:
+        # Example: https://www.ipqualityscore.com/documentation/proxy-detection-api/overview
+        base_url = os.getenv("IPQS_API_URL", "https://ipqualityscore.com/api/json/ip").rstrip("/")
+        data = await _call_json_api("GET", f"{base_url}/{key}/{ip}")
+        if data:
+            return {
+                "verified": True,
+                "source": "ipqualityscore",
+                "is_vpn": bool(data.get("vpn", False)),
+                "is_proxy": bool(data.get("proxy", False)),
+                "is_tor": bool(data.get("tor", False)),
+                "risk_score": int(data.get("fraud_score", 0) or 0),
+                "raw": data,
+            }
+
+    # Fallback from geolocation flags when external VPN API unavailable.
+    return {
+        "verified": False,
+        "source": "geo_flags",
+        "is_vpn": bool(geo_data.get("is_proxy", False)),
+        "is_proxy": bool(geo_data.get("is_proxy", False)),
+        "is_tor": False,
+        "risk_score": 30 if geo_data.get("is_proxy", False) else 0,
+    }
+
+
+async def _verify_device(session: dict, ip: str) -> dict:
+    """
+    Device verification via optional external API.
+    If no external endpoint configured, executes deterministic local checks.
+    """
+    fp = session.get("device_fingerprint", "") or ""
+    ua = (session.get("user_agent", "") or "").lower()
+    platform = (session.get("platform", "") or "").lower()
+    webrtc_supported = session.get("webrtc_supported")
+
+    device_api_url = os.getenv("FRAUD_DEVICE_VERIFY_API_URL", "").strip()
+    device_api_key = os.getenv("FRAUD_DEVICE_VERIFY_API_KEY", "").strip()
+
+    local_flags = {
+        "headless": any(s in ua for s in ["headless", "phantomjs", "selenium", "puppeteer", "playwright"]),
+        "automation": any(s in ua for s in ["bot", "crawler", "spider", "python-requests", "curl", "wget"]),
+        "emulator": any(s in ua for s in ["android sdk", "genymotion", "bluestacks", "nox", "memu"]),
+        "short_fp": bool(fp and len(fp) < 8),
+        "webrtc_disabled": webrtc_supported is False,
+    }
+    local_risk = 0
+    if local_flags["emulator"]:
+        local_risk += 30
+    if local_flags["headless"]:
+        local_risk += 35
+    if local_flags["automation"]:
+        local_risk += 40
+    if local_flags["short_fp"]:
+        local_risk += 15
+    if local_flags["webrtc_disabled"]:
+        local_risk += 10
+    local_risk = min(local_risk, 100)
+
+    if not device_api_url:
+        return {
+            "verified": False,
+            "source": "local_heuristics",
+            "risk_score": local_risk,
+            "device_trust": max(0, 100 - local_risk),
+            "flags": local_flags,
+            "platform": platform,
+        }
+
+    headers = {"Content-Type": "application/json"}
+    if device_api_key:
+        headers["Authorization"] = f"Bearer {device_api_key}"
+
+    payload = {
+        "fingerprint_hash": _safe_hash(fp),
+        "user_agent": ua[:512],
+        "ip": ip,
+        "platform": platform,
+        "webrtc_supported": webrtc_supported,
+    }
+    data = await _call_json_api("POST", device_api_url, json_payload=payload, headers=headers)
+    if not data:
+        return {
+            "verified": False,
+            "source": "local_heuristics",
+            "risk_score": local_risk,
+            "device_trust": max(0, 100 - local_risk),
+            "flags": local_flags,
+            "platform": platform,
+        }
+
+    return {
+        "verified": True,
+        "source": "device_api",
+        "risk_score": int(data.get("risk_score", local_risk)),
+        "device_trust": int(data.get("device_trust", max(0, 100 - local_risk))),
+        "flags": data.get("flags", local_flags),
+        "platform": platform,
+        "raw": data,
+    }
+
+
+async def _run_external_verifications(session_id: str, session: dict) -> dict:
+    """Run all verification methods and store snapshot into session."""
+    ip = _resolve_client_ip(session)
+    fallback_geo = session.get("geolocation", {}) if isinstance(session.get("geolocation"), dict) else {}
+
+    geo_verification = await _verify_geolocation(ip, fallback_geo)
+    geo_data = geo_verification.get("data", fallback_geo)
+    vpn_verification = await _verify_vpn_proxy(ip, geo_data if isinstance(geo_data, dict) else {})
+    device_verification = await _verify_device(session, ip)
+
+    result = {
+        "ip": ip,
+        "checked_at": datetime.utcnow().isoformat(),
+        "geolocation": geo_verification,
+        "vpn_proxy": vpn_verification,
+        "device": device_verification,
+    }
+    store.update(session_id, {"fraud_verification": result, "geolocation": geo_data})
+    return result
+
+
 def _score_geo_mismatch(session: dict) -> dict:
     """Signal 1: IP geolocation vs stated city — 0-100."""
-    geo = session.get("geolocation", {})
+    verification = session.get("fraud_verification", {})
+    verified_geo = (verification.get("geolocation", {}) or {}).get("data", {}) if isinstance(verification, dict) else {}
+    geo = verified_geo if isinstance(verified_geo, dict) and verified_geo else session.get("geolocation", {})
     fields = session.get("extracted_fields", {})
     
     stated_city = None
@@ -54,9 +258,11 @@ def _score_geo_mismatch(session: dict) -> dict:
     # Check for proxy/hosting
     is_proxy = geo.get("is_proxy", False) if isinstance(geo, dict) else False
     is_hosting = geo.get("is_hosting", False) if isinstance(geo, dict) else False
-    
+    vpn_data = (verification.get("vpn_proxy", {}) if isinstance(verification, dict) else {}) or {}
+    vpn_detected = bool(vpn_data.get("is_vpn", False))
+
     score = 50  # Cities don't match
-    if is_proxy:
+    if is_proxy or vpn_detected:
         score += 30
     if is_hosting:
         score += 20
@@ -64,9 +270,9 @@ def _score_geo_mismatch(session: dict) -> dict:
     return {
         "score": min(score, 100),
         "detail": f"City mismatch: stated='{stated_city}', IP='{ip_city}'" +
-                  (", VPN/proxy detected" if is_proxy else "") +
+                  (", VPN/proxy detected" if (is_proxy or vpn_detected) else "") +
                   (", hosting provider" if is_hosting else ""),
-        "raw": {"stated": stated_city, "ip": ip_city, "is_proxy": is_proxy, "is_hosting": is_hosting},
+        "raw": {"stated": stated_city, "ip": ip_city, "is_proxy": is_proxy, "is_hosting": is_hosting, "vpn_detected": vpn_detected},
     }
 
 
@@ -113,6 +319,22 @@ def _score_device_anomaly(session: dict) -> dict:
         score += 15
         details.append("WebRTC not supported (unusual)")
     
+    verification = session.get("fraud_verification", {})
+    device_verification = (verification.get("device", {}) if isinstance(verification, dict) else {}) or {}
+    vpn_verification = (verification.get("vpn_proxy", {}) if isinstance(verification, dict) else {}) or {}
+
+    device_risk = int(device_verification.get("risk_score", 0) or 0)
+    if device_risk > 0:
+        # External/local verifier contributes as confidence-boosted risk.
+        boost = min(int(device_risk * 0.4), 40)
+        score += boost
+        details.append(f"Device verifier risk: {device_risk} (+{boost})")
+
+    vpn_risk = int(vpn_verification.get("risk_score", 0) or 0)
+    if vpn_risk >= 70:
+        score += 20
+        details.append("High VPN/proxy risk from IP verifier")
+
     if not details:
         details.append("No device anomalies detected")
     
@@ -218,6 +440,10 @@ async def compute_fraud_score(session_id: str):
     session = store.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    # Fresh external verification snapshot before scoring.
+    verification = await _run_external_verifications(session_id, session)
+    session = store.get(session_id) or session
     
     # Compute each signal
     signals = {
@@ -248,6 +474,7 @@ async def compute_fraud_score(session_id: str):
         "composite_score": composite,
         "risk_level": risk_level,
         "signals": signals,
+        "verification": verification,
         "weights": SIGNAL_WEIGHTS,
         "timestamp": datetime.utcnow().isoformat(),
     }
@@ -289,6 +516,28 @@ async def compute_fraud_score(session_id: str):
         "signal_scores": {k: v["score"] for k, v in signals.items()},
     })
     
+    return result
+
+
+@router.post("/{session_id}/verify")
+async def verify_fraud_signals(session_id: str):
+    """
+    Run standalone verification methods for:
+    - geolocation (IP → city/region/country)
+    - VPN/proxy detection
+    - device verification
+    """
+    session = store.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    result = await _run_external_verifications(session_id, session)
+    await audit.emit(session_id, "FRAUD_VERIFICATION_RUN", "FRAUD", {
+        "ip": result.get("ip"),
+        "geo_source": (result.get("geolocation") or {}).get("source"),
+        "vpn_source": (result.get("vpn_proxy") or {}).get("source"),
+        "device_source": (result.get("device") or {}).get("source"),
+    })
     return result
 
 
