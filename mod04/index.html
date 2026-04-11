@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AIRAVAT – Liveness Detection</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0a0f;--surface:#12121a;--surface2:#1a1a26;--border:#ffffff0d;
+  --text:#e4e4e7;--text2:#a1a1aa;--green:#22c55e;--red:#ef4444;
+  --amber:#f59e0b;--blue:#3b82f6;--purple:#a855f7;
+}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:24px}
+h1{font-size:1.5rem;font-weight:800;letter-spacing:-.02em;background:linear-gradient(135deg,var(--blue),var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px}
+.subtitle{font-size:.8rem;color:var(--text2);margin-bottom:20px;font-weight:500}
+.container{width:100%;max-width:720px;display:flex;flex-direction:column;gap:16px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px;position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,#ffffff12,transparent)}
+.video-wrap{position:relative;border-radius:10px;overflow:hidden;aspect-ratio:16/9;background:#000}
+video,canvas{width:100%;height:100%;object-fit:cover;display:block;border-radius:10px}
+video{transform:scaleX(-1)}
+canvas{display:none}
+.live-dot{position:absolute;top:12px;left:12px;display:flex;align-items:center;gap:6px;font-size:.7rem;font-weight:600;color:#fff;background:#00000080;backdrop-filter:blur(8px);padding:4px 10px;border-radius:20px}
+.live-dot::before{content:'';width:8px;height:8px;border-radius:50%;background:var(--red);animation:pulse 1.5s infinite}
+.live-dot.active::before{background:var(--green)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.status-badge{position:absolute;top:12px;right:12px;font-size:.75rem;font-weight:700;padding:5px 14px;border-radius:20px;text-transform:uppercase;letter-spacing:.05em}
+.status-badge.live{background:#22c55e22;color:var(--green);border:1px solid #22c55e44}
+.status-badge.spoof{background:#ef444422;color:var(--red);border:1px solid #ef444444}
+.analyzing{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);font-size:.7rem;font-weight:500;color:var(--text2);background:#00000080;backdrop-filter:blur(8px);padding:4px 12px;border-radius:20px;display:none}
+.analyzing.show{display:block}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
+.metric{background:var(--surface2);border-radius:10px;padding:14px;text-align:center}
+.metric .label{font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;color:var(--text2);font-weight:600;margin-bottom:6px}
+.metric .value{font-size:1.4rem;font-weight:700}
+.metric .value.green{color:var(--green)}
+.metric .value.red{color:var(--red)}
+.metric .value.amber{color:var(--amber)}
+.metric .value.blue{color:var(--blue)}
+.score-bar{height:4px;border-radius:2px;background:var(--surface);margin-top:8px;overflow:hidden}
+.score-bar .fill{height:100%;border-radius:2px;transition:width .4s ease,background .4s ease}
+.flags-wrap{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.flag{font-size:.65rem;font-weight:600;padding:3px 10px;border-radius:6px;background:#ef444418;color:var(--red);border:1px solid #ef444433}
+.banner{display:none;padding:12px;border-radius:10px;text-align:center;font-weight:700;font-size:.85rem;animation:bannerPulse 1.5s infinite}
+.banner.spoof-banner{display:block;background:linear-gradient(135deg,#ef444422,#f59e0b11);border:1px solid #ef444444;color:var(--red)}
+@keyframes bannerPulse{0%,100%{opacity:1}50%{opacity:.7}}
+.section-title{font-size:.7rem;text-transform:uppercase;letter-spacing:.1em;color:var(--text2);font-weight:700;margin-bottom:10px}
+.summary-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)}
+.summary-row:last-child{border-bottom:none}
+.summary-row .k{font-size:.8rem;color:var(--text2)}
+.summary-row .v{font-size:.9rem;font-weight:600}
+.timestamp{font-size:.65rem;color:var(--text2);text-align:right;margin-top:6px}
+.signals-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.signal{background:var(--surface2);border-radius:8px;padding:10px;text-align:center}
+.signal .s-label{font-size:.6rem;text-transform:uppercase;letter-spacing:.06em;color:var(--text2);font-weight:600}
+.signal .s-value{font-size:1.1rem;font-weight:700;margin-top:4px}
+</style>
+</head>
+<body>
+<h1>AIRAVAT LIVENESS</h1>
+<p class="subtitle">Tier 4 – Real-time Liveness Detection & Age Estimation</p>
+<div class="container">
+  <div id="spoofBanner" class="banner">⚠ Sustained Spoof Detected</div>
+  <div class="card">
+    <div class="video-wrap">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="canvas"></canvas>
+      <div id="liveDot" class="live-dot">WEBCAM</div>
+      <div id="statusBadge" class="status-badge">—</div>
+      <div id="analyzingLabel" class="analyzing">Analyzing...</div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="grid">
+      <div class="metric">
+        <div class="label">Liveness Score</div>
+        <div class="value" id="livenessScore">—</div>
+        <div class="score-bar"><div class="fill" id="livenessBar" style="width:0%"></div></div>
+      </div>
+      <div class="metric">
+        <div class="label">Rolling Avg</div>
+        <div class="value" id="rollingAvg">—</div>
+        <div class="score-bar"><div class="fill" id="rollingBar" style="width:0%"></div></div>
+      </div>
+      <div class="metric">
+        <div class="label">Predicted Age</div>
+        <div class="value blue" id="predictedAge">—</div>
+      </div>
+      <div class="metric">
+        <div class="label">Age Diff</div>
+        <div class="value" id="ageDiff">—</div>
+      </div>
+      <div class="metric">
+        <div class="label">Frames</div>
+        <div class="value" id="frameCount">0</div>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="section-title">Signals</div>
+    <div class="signals-grid">
+      <div class="signal"><div class="s-label">Motion</div><div class="s-value" id="sigMotion">—</div></div>
+      <div class="signal"><div class="s-label">Blink</div><div class="s-value" id="sigBlink">—</div></div>
+      <div class="signal"><div class="s-label">Head Move</div><div class="s-value" id="sigHead">—</div></div>
+      <div class="signal"><div class="s-label">Texture</div><div class="s-value" id="sigTexture">—</div></div>
+    </div>
+    <div id="flagsWrap" class="flags-wrap"></div>
+  </div>
+  <div class="card">
+    <div class="section-title">Session Summary</div>
+    <div class="summary-row"><span class="k">Avg Liveness</span><span class="v" id="sumAvg">—</span></div>
+    <div class="summary-row"><span class="k">Frame Count</span><span class="v" id="sumFrames">—</span></div>
+    <div class="summary-row"><span class="k">Flagged</span><span class="v" id="sumFlagged">—</span></div>
+    <div class="timestamp" id="lastUpdated"></div>
+  </div>
+</div>
+<script>
+const API = "http://127.0.0.1:8000";
+const SESSION = "demo_session";
+const DECLARED_AGE = 22;
+const CAPTURE_INTERVAL = 3000;
+const SUMMARY_INTERVAL = 10000;
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+
+let sending = false;
+let livenessHistory = [];
+
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: 640, height: 480 } });
+    video.srcObject = stream;
+    document.getElementById("liveDot").classList.add("active");
+  } catch (e) {
+    alert("Camera access denied");
+  }
+}
+
+function captureFrame() {
+  canvas.width = 160;
+  canvas.height = 120;
+  ctx.drawImage(video, 0, 0, 160, 120);
+  return canvas.toDataURL("image/jpeg", 0.5);
+}
+
+async function analyzeFrame() {
+  if (sending) return;
+  sending = true;
+  document.getElementById("analyzingLabel").classList.add("show");
+  const b64 = captureFrame();
+  try {
+    const res = await fetch(`${API}/api/vision/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: SESSION, frame_b64: b64, declared_age: DECLARED_AGE, timestamp: Date.now() })
+    });
+    const d = await res.json();
+    updateUI(d);
+  } catch (e) {
+    console.error("Analyze error:", e);
+  }
+  sending = false;
+  document.getElementById("analyzingLabel").classList.remove("show");
+}
+
+function updateUI(d) {
+  console.log("API RESPONSE:", d);
+
+  const ls = d.liveness_score ?? 0;
+  livenessHistory.push(ls);
+  if (livenessHistory.length > 5) livenessHistory.shift();
+  const avg = livenessHistory.reduce((a, b) => a + b, 0) / livenessHistory.length;
+
+  document.getElementById("livenessScore").textContent = ls.toFixed(3);
+  document.getElementById("livenessScore").className = "value " + (ls > 0.45 ? "green" : "red");
+  document.getElementById("livenessBar").style.width = (ls * 100) + "%";
+  document.getElementById("livenessBar").style.background = ls > 0.45 ? "var(--green)" : "var(--red)";
+
+  document.getElementById("rollingAvg").textContent = avg.toFixed(3);
+  document.getElementById("rollingAvg").className = "value " + (avg > 0.45 ? "green" : "red");
+  document.getElementById("rollingBar").style.width = (avg * 100) + "%";
+  document.getElementById("rollingBar").style.background = avg > 0.45 ? "var(--green)" : "var(--red)";
+
+  const badge = document.getElementById("statusBadge");
+  badge.textContent = d.status ?? "—";
+  badge.className = "status-badge " + (d.status === "LIVE" ? "live" : "spoof");
+
+  document.getElementById("predictedAge").textContent = d.predicted_age ?? "—";
+  const adEl = document.getElementById("ageDiff");
+  adEl.textContent = (d.age_difference ?? 0).toFixed(1);
+  adEl.className = "value " + ((d.age_difference ?? 0) > 8 ? "red" : "green");
+
+  document.getElementById("frameCount").textContent = d.frames ?? 0;
+
+  const sig = d.signals || {};
+  document.getElementById("sigMotion").textContent = (sig.motion ?? 0).toFixed(3);
+  document.getElementById("sigBlink").textContent = sig.blink ?? 0;
+  document.getElementById("sigHead").textContent = (sig.head ?? 0).toFixed(3);
+  document.getElementById("sigTexture").textContent = (sig.texture ?? 0).toFixed(3);
+
+  const fw = document.getElementById("flagsWrap");
+  fw.innerHTML = "";
+  (d.flags || []).forEach(f => { const s = document.createElement("span"); s.className = "flag"; s.textContent = f; fw.appendChild(s); });
+
+  document.getElementById("spoofBanner").className = d.status === "SPOOF" ? "banner spoof-banner" : "banner";
+  document.getElementById("lastUpdated").textContent = "Updated: " + new Date().toLocaleTimeString();
+}
+
+startCamera();
+setInterval(analyzeFrame, CAPTURE_INTERVAL);
+</script>
+</body>
+</html>
