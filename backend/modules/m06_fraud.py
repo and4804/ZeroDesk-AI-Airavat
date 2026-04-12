@@ -419,11 +419,11 @@ def _parse_financial_figure(text: str) -> float:
         val = float(val_str)
     except ValueError:
         return 0.0
-    if mult == \'lakh\':
+    if mult == 'lakh':
         val *= 100000
-    elif mult in (\'thousand\', \'k\'):
+    elif mult in ('thousand', 'k'):
         val *= 1000
-    elif mult == \'crore\':
+    elif mult == 'crore':
         val *= 10000000
     return val
 
