@@ -1,0 +1,189 @@
+[
+  {
+    "applicant_id": "PRIYA-001",
+    "name": "Priya Sharma",
+    "credit_score": 740,
+    "active_loan_count": 1,
+    "dpd_history": [],
+    "written_off_accounts": 0,
+    "inquiry_count_90d": 1,
+    "monthly_income": 60000,
+    "monthly_obligations": 15000,
+    "payment_history": {
+      "on_time_pct": 98,
+      "dpd_30_count": 0,
+      "dpd_60_count": 0,
+      "dpd_90_count": 0
+    },
+    "credit_utilization": {
+      "total_limit": 300000,
+      "current_balance": 45000
+    },
+    "credit_mix_age": {
+      "secured_count": 1,
+      "unsecured_count": 1,
+      "oldest_account_months": 72
+    },
+    "new_credit": {
+      "enquiries_last_6m": 1,
+      "new_accounts_last_6m": 0
+    }
+  },
+  {
+    "applicant_id": "ROHIT-002",
+    "name": "Rohit X",
+    "credit_score": 580,
+    "active_loan_count": 3,
+    "dpd_history": [
+      {"days": 30, "count": 2, "year": 2025}
+    ],
+    "written_off_accounts": 0,
+    "inquiry_count_90d": 5,
+    "monthly_income": 40000,
+    "monthly_obligations": 25000,
+    "payment_history": {
+      "on_time_pct": 72,
+      "dpd_30_count": 3,
+      "dpd_60_count": 1,
+      "dpd_90_count": 0
+    },
+    "credit_utilization": {
+      "total_limit": 200000,
+      "current_balance": 160000
+    },
+    "credit_mix_age": {
+      "secured_count": 0,
+      "unsecured_count": 3,
+      "oldest_account_months": 18
+    },
+    "new_credit": {
+      "enquiries_last_6m": 5,
+      "new_accounts_last_6m": 2
+    }
+  },
+  {
+    "applicant_id": "MEERA-003",
+    "name": "Meera Patil",
+    "credit_score": 680,
+    "active_loan_count": 2,
+    "dpd_history": [
+      {"days": 30, "count": 1, "year": 2026}
+    ],
+    "written_off_accounts": 0,
+    "inquiry_count_90d": 2,
+    "monthly_income": 35000,
+    "monthly_obligations": 12000,
+    "payment_history": {
+      "on_time_pct": 88,
+      "dpd_30_count": 1,
+      "dpd_60_count": 0,
+      "dpd_90_count": 0
+    },
+    "credit_utilization": {
+      "total_limit": 150000,
+      "current_balance": 60000
+    },
+    "credit_mix_age": {
+      "secured_count": 1,
+      "unsecured_count": 1,
+      "oldest_account_months": 48
+    },
+    "new_credit": {
+      "enquiries_last_6m": 2,
+      "new_accounts_last_6m": 1
+    }
+  },
+  {
+    "applicant_id": "EDGE-LOW-001",
+    "name": "Amit Verma",
+    "credit_score": null,
+    "active_loan_count": 5,
+    "dpd_history": [
+      {"days": 60, "count": 2, "year": 2025},
+      {"days": 90, "count": 1, "year": 2024}
+    ],
+    "written_off_accounts": 1,
+    "inquiry_count_90d": 7,
+    "monthly_income": 25000,
+    "monthly_obligations": 18000,
+    "payment_history": {
+      "on_time_pct": 55,
+      "dpd_30_count": 5,
+      "dpd_60_count": 2,
+      "dpd_90_count": 1
+    },
+    "credit_utilization": {
+      "total_limit": 100000,
+      "current_balance": 95000
+    },
+    "credit_mix_age": {
+      "secured_count": 0,
+      "unsecured_count": 4,
+      "oldest_account_months": 12
+    },
+    "new_credit": {
+      "enquiries_last_6m": 7,
+      "new_accounts_last_6m": 3
+    }
+  },
+  {
+    "applicant_id": "EDGE-PERFECT-002",
+    "name": "Sunita Reddy",
+    "credit_score": null,
+    "active_loan_count": 0,
+    "dpd_history": [],
+    "written_off_accounts": 0,
+    "inquiry_count_90d": 0,
+    "monthly_income": 150000,
+    "monthly_obligations": 10000,
+    "payment_history": {
+      "on_time_pct": 100,
+      "dpd_30_count": 0,
+      "dpd_60_count": 0,
+      "dpd_90_count": 0
+    },
+    "credit_utilization": {
+      "total_limit": 1000000,
+      "current_balance": 50000
+    },
+    "credit_mix_age": {
+      "secured_count": 2,
+      "unsecured_count": 1,
+      "oldest_account_months": 144
+    },
+    "new_credit": {
+      "enquiries_last_6m": 0,
+      "new_accounts_last_6m": 0
+    }
+  },
+  {
+    "applicant_id": "EDGE-FOIR-003",
+    "name": "Karan Joshi",
+    "credit_score": 710,
+    "active_loan_count": 3,
+    "dpd_history": [],
+    "written_off_accounts": 0,
+    "inquiry_count_90d": 2,
+    "monthly_income": 45000,
+    "monthly_obligations": 24000,
+    "payment_history": {
+      "on_time_pct": 92,
+      "dpd_30_count": 0,
+      "dpd_60_count": 0,
+      "dpd_90_count": 0
+    },
+    "credit_utilization": {
+      "total_limit": 250000,
+      "current_balance": 100000
+    },
+    "credit_mix_age": {
+      "secured_count": 1,
+      "unsecured_count": 2,
+      "oldest_account_months": 60
+    },
+    "new_credit": {
+      "enquiries_last_6m": 2,
+      "new_accounts_last_6m": 0
+    }
+  }
+]
