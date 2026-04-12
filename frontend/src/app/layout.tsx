@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
+import { Inter, Space_Grotesk } from "next/font/google";
 import "./globals.css";
 
 const inter = Inter({
@@ -7,10 +7,16 @@ const inter = Inter({
   variable: "--font-inter",
 });
 
+const spaceGrotesk = Space_Grotesk({
+  subsets: ["latin"],
+  variable: "--font-space-grotesk",
+  weight: ["400", "500", "600", "700"],
+});
+
 export const metadata: Metadata = {
-  title: "AgentFinance AI — Autonomous Loan Onboarding",
-  description: "AI-powered zero-human-agent retail loan onboarding platform. Complete your loan application via a browser-based video call.",
-  keywords: ["AI", "loan", "onboarding", "fintech", "autonomous"],
+  title: "AgentFinance AI — Sovereign Intelligence",
+  description: "AI-powered zero-human-agent retail loan onboarding platform. Live AI evaluation and autonomous decision system.",
+  keywords: ["AI", "loan", "onboarding", "fintech", "autonomous", "sovereign intelligence"],
 };
 
 export default function RootLayout({
@@ -20,7 +26,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className="dark">
-      <body className={`${inter.variable} font-sans antialiased gradient-bg min-h-screen`}>
+      <body className={`${inter.variable} ${spaceGrotesk.variable} antialiased min-h-screen`} style={{ background: 'var(--bg-base, #0B0B0C)' }}>
         {children}
       </body>
     </html>
