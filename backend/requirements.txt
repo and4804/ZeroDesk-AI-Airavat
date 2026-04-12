@@ -35,3 +35,4 @@ cryptography==44.0.3
 # Utilities
 pydantic==2.11.1
 pydantic-settings==2.9.1
+geopy>=2.4.1

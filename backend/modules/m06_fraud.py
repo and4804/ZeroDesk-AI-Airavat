@@ -6,17 +6,20 @@ Multi-signal algorithmic fraud scoring (NOT just LLM-based).
 
 import json
 import os
+import re
 import hashlib
 from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 import httpx
+from geopy.geocoders import Nominatim
 
 from config import settings
 from database import get_db
 from session_store import store
 from events import audit
+from utils.geo import haversine_distance
 
 router = APIRouter(prefix="/api/fraud", tags=["M06 - Fraud"])
 
@@ -247,32 +250,56 @@ def _score_geo_mismatch(session: dict) -> dict:
         stated_city = fields["city"].lower()
     
     ip_city = geo.get("city", "").lower() if isinstance(geo, dict) else ""
+    ip_lat = geo.get("lat") if isinstance(geo, dict) else None
+    ip_lon = geo.get("lon") if isinstance(geo, dict) else None
     
     # Edge cases
     if not stated_city or not ip_city or ip_city == "local":
         return {"score": 0, "detail": "Insufficient data for geo comparison", "raw": {"stated": stated_city, "ip": ip_city}}
     
-    if stated_city == ip_city or stated_city in ip_city or ip_city in stated_city:
-        return {"score": 0, "detail": "Cities match", "raw": {"stated": stated_city, "ip": ip_city}}
-    
+    distance_km = None
+    if ip_lat is not None and ip_lon is not None:
+        try:
+            geolocator = Nominatim(user_agent="zerodesk_fraud_detector_haversine")
+            location = geolocator.geocode(stated_city, timeout=5)
+            if location:
+                distance_km = haversine_distance(location.latitude, location.longitude, ip_lat, ip_lon)
+        except Exception:
+            pass
+
+    score = 0
+    detail = "Cities match"
+
+    if distance_km is not None:
+        if distance_km > 200:
+            score = 50
+            detail = f"City mismatch: stated='{stated_city}' is {distance_km:.1f}km away from IP location (>200km)"
+        else:
+            detail = f"Cities match (Distance: {distance_km:.1f}km)"
+    else:
+        if stated_city == ip_city or stated_city in ip_city or ip_city in stated_city:
+            detail = "Cities match"
+        else:
+            score = 50
+            detail = f"City mismatch: stated='{stated_city}', IP='{ip_city}'"
+            
     # Check for proxy/hosting
     is_proxy = geo.get("is_proxy", False) if isinstance(geo, dict) else False
     is_hosting = geo.get("is_hosting", False) if isinstance(geo, dict) else False
     vpn_data = (verification.get("vpn_proxy", {}) if isinstance(verification, dict) else {}) or {}
     vpn_detected = bool(vpn_data.get("is_vpn", False))
 
-    score = 50  # Cities don't match
     if is_proxy or vpn_detected:
         score += 30
+        detail += ", VPN/proxy detected"
     if is_hosting:
         score += 20
+        detail += ", hosting provider"
     
     return {
         "score": min(score, 100),
-        "detail": f"City mismatch: stated='{stated_city}', IP='{ip_city}'" +
-                  (", VPN/proxy detected" if (is_proxy or vpn_detected) else "") +
-                  (", hosting provider" if is_hosting else ""),
-        "raw": {"stated": stated_city, "ip": ip_city, "is_proxy": is_proxy, "is_hosting": is_hosting, "vpn_detected": vpn_detected},
+        "detail": detail,
+        "raw": {"stated": stated_city, "ip": ip_city, "distance_km": distance_km, "is_proxy": is_proxy, "is_hosting": is_hosting, "vpn_detected": vpn_detected},
     }
 
 
@@ -380,29 +407,72 @@ def _score_age_inconsistency(session: dict) -> dict:
     }
 
 
+def _parse_financial_figure(text: str) -> float:
+    if not isinstance(text, str):
+        text = str(text)
+    text = text.lower().replace(',', '')
+    match = re.search(r'([\d.]+)\s*(lakh|thousand|crore|k)?', text)
+    if not match:
+        return 0.0
+    val_str, mult = match.groups()
+    try:
+        val = float(val_str)
+    except ValueError:
+        return 0.0
+    if mult == \'lakh\':
+        val *= 100000
+    elif mult in (\'thousand\', \'k\'):
+        val *= 1000
+    elif mult == \'crore\':
+        val *= 10000000
+    return val
+
 def _score_transcript_contradictions(session: dict) -> dict:
-    """Signal 4: LLM-detected contradictions in transcript — 0-100."""
-    assessment = session.get("llm_assessment", {})
-    contradictions = assessment.get("contradictions", [])
+    """Signal 4: Algorithmic contradiction detection in transcript — 0-100."""
+    transcript_list = session.get("transcript", [])
+    transcript_text = ""
+    if isinstance(transcript_list, list):
+        transcript_text = " ".join([str(t.get("text", "")) if isinstance(t, dict) else str(t) for t in transcript_list])
+    elif isinstance(transcript_list, str):
+        transcript_text = transcript_list
+        
+    fields = session.get("extracted_fields", {})
+    income, requested_amount = 0.0, 0.0
     
-    if not contradictions:
-        return {"score": 0, "detail": "No contradictions detected", "raw": {}}
-    
-    # Score based on number and severity
-    score = 0
-    for c in contradictions:
-        severity = c.get("severity", "low")
-        if severity == "high":
-            score += 35
-        elif severity == "medium":
-            score += 20
-        else:
-            score += 10
-    
+    # Try regex on transcript
+    income_match = re.search(r'(?:income|salary|earn|earning|make).*?([\d.]+\s*(?:lakh|thousand|crore|k)?)', transcript_text.lower())
+    if income_match:
+        income = _parse_financial_figure(income_match.group(1))
+        
+    loan_match = re.search(r'(?:loan|need|want|request|amt|amount).*?([\d.]+\s*(?:lakh|thousand|crore|k)?)', transcript_text.lower())
+    if loan_match:
+        requested_amount = _parse_financial_figure(loan_match.group(1))
+        
+    # Fallback to extracted_fields
+    if income <= 0:
+        inc_field = fields.get("income", fields.get("stated_income", {}))
+        income = _parse_financial_figure(str(inc_field.get("value", "")) if isinstance(inc_field, dict) else str(inc_field))
+        
+    if requested_amount <= 0:
+        loan_field = fields.get("loan_amount", fields.get("requested_amount", {}))
+        requested_amount = _parse_financial_figure(str(loan_field.get("value", "")) if isinstance(loan_field, dict) else str(loan_field))
+        
+    if income <= 0 or requested_amount <= 0:
+        return {"score": 0, "detail": "Insufficient financial data for ratio check", "raw": {"income": income, "requested_amount": requested_amount}}
+        
+    ratio = requested_amount / income
+    if ratio > 5.0:
+        score = min(int(ratio * 10), 100)
+        return {
+            "score": score,
+            "detail": f"Unrealistic loan-to-income ratio: {ratio:.2f} (Requested: {requested_amount}, Income: {income})",
+            "raw": {"ratio": ratio, "income": income, "requested_amount": requested_amount}
+        }
+        
     return {
-        "score": min(score, 100),
-        "detail": f"{len(contradictions)} contradiction(s) found",
-        "raw": {"contradictions": contradictions},
+        "score": 0,
+        "detail": f"Loan-to-income ratio is acceptable: {ratio:.2f}",
+        "raw": {"ratio": ratio, "income": income, "requested_amount": requested_amount}
     }
 
 
