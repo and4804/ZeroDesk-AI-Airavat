@@ -53,14 +53,14 @@ app.add_middleware(
 # ──────────────────────────────────────────────────────────────────
 
 from modules.m01_session import router as m01_router
-from modules.m02_stt import router as m02_router
+from backend.modules.m02_stt_mod1_int import router as m02_router
 from modules.m03_consent import router as m03_router
-from modules.m04_vision import router as m04_router
-from modules.m05_llm import router as m05_router
+from backend.modules.m04_vision_mod1_int import router as m04_router
+from backend.modules.m05_llm_mod1_int import router as m05_router
 from modules.m06_fraud import router as m06_router
 from modules.m07_bureau import router as m07_router
-from modules.m08_offer import router as m08_router
-from modules.m09_orchestrator import router as m09_router
+from backend.modules.m08_offer_mod1_init import router as m08_router
+from backend.modules.m09_orchestrator_mod1_init import router as m09_router
 from modules.m10_compliance import router as m10_router
 
 app.include_router(m01_router)

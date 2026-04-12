@@ -1,0 +1,38 @@
+# Core
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+python-dotenv==1.1.0
+python-multipart==0.0.20
+
+# WebSocket + Socket.IO
+python-socketio==5.12.1
+
+# Auth
+PyJWT==2.10.1
+
+# Database
+aiosqlite==0.21.0
+
+# STT
+faster-whisper==1.1.1
+
+# LLM
+groq==0.25.0
+
+# Vision
+mediapipe==0.10.21
+deepface==0.0.93
+opencv-python-headless==4.11.0.86
+numpy<2
+
+# HTTP
+httpx==0.28.1
+aiohttp==3.11.17
+
+# Crypto
+cryptography==44.0.3
+
+# Utilities
+pydantic==2.11.1
+pydantic-settings==2.9.1
+geopy>=2.4.1
