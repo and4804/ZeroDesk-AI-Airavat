@@ -158,6 +158,72 @@ export async function chatWithAI(sessionId: string, message: string, currentStag
   });
 }
 
+// Guardrail relevance check
+export async function checkGuardrail(text: string, nextMissingField?: string): Promise<{
+  is_relevant: boolean;
+  similarity: number;
+  matched_kw: string | null;
+  redirect_msg: string | null;
+}> {
+  return apiCall('/api/guardrails/check', {
+    method: 'POST',
+    body: JSON.stringify({ text, next_missing_field: nextMissingField }),
+  });
+}
+
+// Transcript export (triggers browser file download)
+export async function exportTranscript(sessionId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/stt/${sessionId}/export`);
+  if (!res.ok) throw new Error('Export failed');
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `transcript_${sessionId.slice(0, 8)}.txt`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Video upload (sends raw Blob/File)
+export async function uploadVideo(sessionId: string, videoBlob: Blob): Promise<unknown> {
+  const form = new FormData();
+  form.append('file', videoBlob, 'recording.webm');
+  const res = await fetch(`${API_BASE}/api/video/${sessionId}/upload`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || 'Video upload failed');
+  }
+  return res.json();
+}
+
+// Trigger keyword-based clip extraction
+export async function extractVideoClips(sessionId: string): Promise<unknown> {
+  return apiCall(`/api/video/${sessionId}/extract`, { method: 'POST' });
+}
+
+// Audit PDF download (triggers browser download)
+export async function downloadAuditPdf(sessionId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/compliance/sessions/${sessionId}/report?format=pdf`);
+  if (!res.ok) throw new Error('PDF generation failed');
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `audit_report_${sessionId.slice(0, 8)}.pdf`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// SSE audit replay — returns EventSource (caller must close it)
+export function createReplayEventSource(sessionId: string, delayMs = 600): EventSource {
+  return new EventSource(
+    `${API_BASE}/api/compliance/sessions/${sessionId}/replay?delay_ms=${delayMs}`,
+  );
+}
+
 // STT WebSocket
 export function createSTTWebSocket(sessionId: string): WebSocket {
   return new WebSocket(`${WS_BASE}/api/stt/ws/${sessionId}`);

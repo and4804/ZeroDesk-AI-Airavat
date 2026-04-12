@@ -52,6 +52,12 @@ PERSONA_OVERRIDES: dict[str, dict[str, Any]] = {
     "PRIYA-001":  {"fraud_score": 12,  "liveness_avg": 0.92, "consent_detected": True},
     "ROHIT-002":  {"fraud_score": 82,  "liveness_avg": 0.45, "consent_detected": True},
     "MEERA-003":  {"fraud_score": 35,  "liveness_avg": 0.88, "consent_detected": True},
+    "PRIYA001":  {"fraud_score": 12,  "liveness_avg": 0.92, "consent_detected": True},
+    "ROHIT001":  {"fraud_score": 82,  "liveness_avg": 0.45, "consent_detected": True},
+    "MEERA001":  {"fraud_score": 35,  "liveness_avg": 0.88, "consent_detected": True},
+    "EDGE-LOW-001":  {"fraud_score": 75,  "liveness_avg": 0.55, "consent_detected": True},
+    "EDGE-PERFECT-002":  {"fraud_score": 5, "liveness_avg": 0.95, "consent_detected": True},
+    "EDGE-FOIR-003":  {"fraud_score": 20,  "liveness_avg": 0.88, "consent_detected": True},
 }
 
 # ---------------------------------------------------------------------------
@@ -85,8 +91,26 @@ def load_rules_config() -> list[dict]:
 
 
 def get_seed_profile(applicant_id: str) -> dict | None:
-    """Look up a seed profile by applicant_id (case-insensitive)."""
+    """Look up a seed profile by applicant_id with multiple normalization strategies."""
+    import re
+    normalized = applicant_id.upper().strip()
+
+    # Strategy 1: Direct match
     for profile in load_seed_data():
-        if profile["applicant_id"].upper() == applicant_id.upper():
+        if profile["applicant_id"].upper() == normalized:
             return profile
+
+    # Strategy 2: Insert hyphen before trailing digits  (PRIYA001 → PRIYA-001)
+    hyphenated = re.sub(r'([A-Z]+)(\d+)$', r'\1-\2', normalized)
+    if hyphenated != normalized:
+        for profile in load_seed_data():
+            if profile["applicant_id"].upper() == hyphenated:
+                return profile
+
+    # Strategy 3: First name match (priya → PRIYA-001)
+    for profile in load_seed_data():
+        first_name = profile["name"].split()[0].upper()
+        if first_name == normalized or normalized.startswith(first_name):
+            return profile
+
     return None

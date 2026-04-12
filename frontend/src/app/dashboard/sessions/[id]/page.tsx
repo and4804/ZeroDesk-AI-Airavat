@@ -13,6 +13,11 @@ export default function SessionDetailPage() {
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('overview');
 
+  // Replay SSE state
+  const [replayActive, setReplayActive] = useState(false);
+  const [replayEvents, setReplayEvents] = useState<Array<Record<string, unknown>>>([]);
+  const [replayDone, setReplayDone] = useState(false);
+
   useEffect(() => {
     async function load() {
       try {
@@ -42,6 +47,39 @@ export default function SessionDetailPage() {
     } catch (err) {
       alert('Failed to generate report: ' + (err as Error).message);
     }
+  }
+
+  async function handleDownloadPdf() {
+    try {
+      await api.downloadAuditPdf(sessionId);
+    } catch (err) {
+      alert('PDF export failed: ' + (err as Error).message);
+    }
+  }
+
+  function handleReplay() {
+    if (replayActive) return;
+    setReplayEvents([]);
+    setReplayDone(false);
+    setReplayActive(true);
+    setActiveTab('audit');
+
+    const es = api.createReplayEventSource(sessionId, 600);
+    es.addEventListener('audit_event', (e: MessageEvent) => {
+      try {
+        const evt = JSON.parse(e.data) as Record<string, unknown>;
+        setReplayEvents(prev => [...prev, evt]);
+      } catch { /* ignore parse errors */ }
+    });
+    es.addEventListener('done', () => {
+      setReplayDone(true);
+      setReplayActive(false);
+      es.close();
+    });
+    es.onerror = () => {
+      setReplayActive(false);
+      es.close();
+    };
   }
 
   if (loading) {
@@ -89,9 +127,18 @@ export default function SessionDetailPage() {
             <span className="text-xs text-slate-600">{session.created_at as string}</span>
           </div>
         </div>
-        <button onClick={handleExportReport} className="btn-primary text-sm">
-          Export Audit Report
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={handleReplay}
+            disabled={replayActive}
+            className="btn-secondary text-sm"
+            title="Replay all audit events in chronological order"
+          >
+            {replayActive ? '⏳ Replaying…' : '▶ Replay Session'}
+          </button>
+          <button onClick={handleDownloadPdf} className="btn-secondary text-sm">⬇ PDF</button>
+          <button onClick={handleExportReport} className="btn-primary text-sm">Export JSON</button>
+        </div>
       </header>
 
       {/* Tabs */}
@@ -401,26 +448,50 @@ export default function SessionDetailPage() {
 
       {/* Audit Events */}
       {activeTab === 'audit' && (
-        <div className="glass-card p-6">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="font-semibold text-white">Audit Event Trail ({events?.length || 0} events)</h3>
-            <button onClick={handleExportReport} className="btn-secondary text-xs">Download Report</button>
-          </div>
-          {events?.length > 0 ? (
-            <div className="space-y-1 max-h-[600px] overflow-y-auto">
-              {events.map((e, i) => (
-                <div key={i} className="flex items-start gap-3 p-2 rounded text-xs hover:bg-white/[0.03]">
-                  <span className="text-slate-600 w-8">{i + 1}</span>
-                  <span className="text-indigo-400 w-40 font-mono">{e.event_type as string}</span>
-                  <span className="text-slate-500 w-24">{e.stage as string}</span>
-                  <span className="text-slate-400 flex-1 truncate">{JSON.stringify(e.data)}</span>
-                  <span className="text-slate-600 w-20">{(e.timestamp as string)?.slice(11, 19)}</span>
-                </div>
-              ))}
+        <div className="space-y-4">
+          {/* Live Replay Stream */}
+          {(replayActive || replayDone) && (
+            <div className="glass-card p-4 border border-indigo-500/30">
+              <div className="flex items-center gap-2 mb-3">
+                <span className={`w-2 h-2 rounded-full ${replayActive ? 'bg-indigo-400 animate-pulse' : 'bg-emerald-400'}`} />
+                <span className="text-sm font-semibold text-white">
+                  {replayActive ? 'Live Replay…' : `Replay Complete — ${replayEvents.length} events`}
+                </span>
+              </div>
+              <div className="space-y-1 max-h-[300px] overflow-y-auto">
+                {replayEvents.map((e, i) => (
+                  <div key={i} className="flex items-start gap-3 p-2 rounded text-xs bg-indigo-500/5 animate-pulse-once">
+                    <span className="text-indigo-400 w-40 font-mono">{e.event_type as string}</span>
+                    <span className="text-slate-500 w-20">{e.module as string}</span>
+                    <span className="text-slate-400 flex-1 truncate">{JSON.stringify(e.data)}</span>
+                    <span className="text-slate-600 w-20">{(e.timestamp as string)?.slice(11, 19)}</span>
+                  </div>
+                ))}
+              </div>
             </div>
-          ) : (
-            <p className="text-slate-500">No audit events</p>
           )}
+
+          <div className="glass-card p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="font-semibold text-white">Full Audit Event Trail ({events?.length || 0} events)</h3>
+              <button onClick={handleExportReport} className="btn-secondary text-xs">Download JSON</button>
+            </div>
+            {events?.length > 0 ? (
+              <div className="space-y-1 max-h-[600px] overflow-y-auto">
+                {events.map((e, i) => (
+                  <div key={i} className="flex items-start gap-3 p-2 rounded text-xs hover:bg-white/[0.03]">
+                    <span className="text-slate-600 w-8">{i + 1}</span>
+                    <span className="text-indigo-400 w-40 font-mono">{e.event_type as string}</span>
+                    <span className="text-slate-500 w-24">{e.module as string}</span>
+                    <span className="text-slate-400 flex-1 truncate">{JSON.stringify(e.data)}</span>
+                    <span className="text-slate-600 w-20">{(e.timestamp as string)?.slice(11, 19)}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-slate-500">No audit events</p>
+            )}
+          </div>
         </div>
       )}
 

@@ -170,6 +170,19 @@ CREATE TABLE IF NOT EXISTS pipeline_states (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- M-Video: Session video recordings and keyword clips
+CREATE TABLE IF NOT EXISTS video_recordings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    file_path TEXT,
+    file_hash TEXT,
+    size_bytes INTEGER DEFAULT 0,
+    clips_json TEXT DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_transcripts_session ON transcripts(session_id);
 CREATE INDEX IF NOT EXISTS idx_extracted_fields_session ON extracted_fields(session_id);
@@ -178,6 +191,7 @@ CREATE INDEX IF NOT EXISTS idx_vision_session ON vision_results(session_id);
 CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_events(session_id);
 CREATE INDEX IF NOT EXISTS idx_audit_type ON audit_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_offers_session ON offers(session_id);
+CREATE INDEX IF NOT EXISTS idx_video_session ON video_recordings(session_id);
 """ 
 
 

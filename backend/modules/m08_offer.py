@@ -15,6 +15,7 @@ from config import settings
 from database import get_db
 from session_store import store
 from events import audit
+from models.llm_responses import NegotiationResponse
 
 router = APIRouter(prefix="/api/offer", tags=["M08 - Offer"])
 
@@ -136,15 +137,15 @@ def _generate_offer(session: dict) -> dict:
     interest_rate = round(base_rate + risk_premium + score_premium + fraud_premium, 2)
     interest_rate = min(max(interest_rate, 9.0), 24.0)  # Cap between 9-24%
     
-    # EMI table for different tenures
-    tenures = [12, 24, 36, 48, 60]
+    # EMI table for all available tenures
     emi_table = []
-    for months in tenures:
+    for months in _TENURE_OPTIONS:
         emi = _calculate_emi(eligible_amount, interest_rate, months)
         total_payment = emi * months
         total_interest = total_payment - eligible_amount
         emi_table.append({
             "tenure_months": months,
+            "tenure_years": round(months / 12, 1),
             "emi": emi,
             "total_payment": round(total_payment, 2),
             "total_interest": round(total_interest, 2),
@@ -181,155 +182,248 @@ def _generate_offer(session: dict) -> dict:
 # Negotiation Agent
 # ──────────────────────────────────────────────────────────────────
 
-NEGOTIATION_PROMPT = """You are an expert, persuasive loan negotiation agent for a bank. You must convince the applicant to accept the current loan offer.
+_TENURE_OPTIONS = [12, 24, 36, 48, 60, 72, 84]  # months available to offer
+_MAX_TENURE = 84
+_MIN_TENURE = 12
 
-Current offer:
-- Loan Amount: {amount}
+NEGOTIATION_PROMPT = """You are a professional loan advisor at a bank. Your goal is to help the applicant find loan terms they can accept while staying within bank policy.
+
+CURRENT OFFER:
+- Loan Amount : ₹{amount:,}
 - Interest Rate: {rate}% p.a.
-- Tenure: {tenure} months
-- EMI: {emi}/month
-- Credit Score: {credit_score}
-- Risk Profile: {risk_persona}
+- Tenure       : {tenure} months  ({tenure_years} years)
+- Monthly EMI  : ₹{emi:,.0f}
+- Credit Score : {credit_score}
+- Risk Profile : {risk_persona}
 
-Original offer rate: {original_rate}%
-Minimum allowed rate: {min_rate}% (NEVER go below this)
+BANK POLICY LIMITS (HARD — never violate):
+- Rate floor  : {min_rate}% — NEVER quote a rate below this
+- Rate ceiling: 24%
+- Min tenure  : {min_tenure} months
+- Max tenure  : {max_tenure} months ({max_tenure_years} years)
+- Loan amount : cannot be increased; current max is ₹{amount:,}
 
-Negotiation round: {round_num}
-Previous negotiation history:
+EMI TABLE at current rate {rate}% for this amount:
+{tenure_table}
+
+INTENT DETECTION — read the applicant's message and respond accordingly:
+
+► If they ask to EXTEND TENURE / MORE YEARS / REDUCE EMI by stretching:
+  • Propose a longer tenure from the EMI table above.
+  • Pick the next sensible step up (e.g. if current is 36 mo, suggest 48 or 60).
+  • State the new tenure in BOTH months AND years, and the new lower EMI clearly.
+  • Max allowed: {max_tenure} months ({max_tenure_years} years).
+
+► If they ask for LOWER RATE / REDUCE INTEREST:
+  • Round 1: offer 0.25% goodwill discount if not already applied (floor: {min_rate}%).
+  • Round 2: offer another 0.25% if still above floor. Mention credit score justification.
+  • Round 3+: explain rate is already competitive; pivot to tenure extension instead.
+
+► If they ask for MORE MONEY / HIGHER AMOUNT:
+  • Explain the amount is set by income + credit policy (max ₹{amount:,}).
+  • Offer to make the current amount more affordable by extending tenure.
+
+► If they express vague dissatisfaction:
+  • Ask which is the bigger concern — the monthly EMI or the total cost — then address it.
+
+Negotiation round : {round_num}
+Previous history  :
 {history}
 
-The applicant just said: "{objection}"
+Applicant said: "{objection}"
 
-STRATEGY (follow strictly based on round number):
-- Round 1: Acknowledge concern warmly. Offer a SMALL discount of 0.25% as a goodwill gesture. Say something like "I understand, let me see what I can do..."
-- Round 2: If they push again, offer another 0.25% discount (if still above min_rate). Explain why: mention their credit score, risk profile, and market benchmark rates.
-- Round 3+: DO NOT offer any more discounts. Instead, CONVINCE the user by:
-  * Explaining the rate is already competitive for their credit profile (credit score {credit_score})
-  * Comparing to market rates (typical personal loan: 12-24%, home loan: 8.5-12%)
-  * Highlighting the benefit of the loan (achieving their goal)
-  * Offering flexible tenure instead (longer tenure = lower EMI)
-  * Mentioning they can refinance later when credit score improves
-  * Being empathetic but firm
+Rules:
+- Response: 2-3 conversational sentences. Warm but professional.
+- ALWAYS recalculate EMI correctly when changing tenure or rate.
+- Only change what the applicant asked to change.
+- Do NOT set adjusted_offer if nothing changes.
 
-IMPORTANT: Keep responses SHORT (2-3 sentences max). Be conversational, not robotic. Never repeat the same argument twice.
-
-Respond ONLY with valid JSON:
+Respond ONLY with valid JSON (no markdown, no extra text):
 {{
-  "response_text": "Your conversational response (2-3 sentences)",
+  "response_text": "Your warm 2-3 sentence response",
   "adjusted_offer": {{
     "amount": {amount},
-    "rate": {rate},
-    "tenure": {tenure},
-    "emi": {emi}
+    "rate": <new rate as a number, respecting floor/ceiling>,
+    "tenure": <new tenure in months, between {min_tenure} and {max_tenure}>,
+    "emi": <recalculated EMI>
   }},
   "is_final": false
-}}"""
+}}
+Set "adjusted_offer" to null if nothing about the offer is changing."""
 
 
-async def _negotiate(offer: dict, objection: str, round_num: int, max_rounds: int = 999) -> dict:
-    """LLM-powered negotiation micro-agent with 3-phase strategy."""
-    
-    original_rate = offer.get("rate_breakdown", {}).get("base_rate", offer["interest_rate"])
-    min_rate = max(original_rate - 1.0, 9.0)  # Can only discount up to 1% total
-    credit_score = offer.get("credit_score", 650)
-    risk_persona = offer.get("risk_persona", "moderate_borrower")
-    
-    # Build history from negotiation log
-    history_lines = []
-    for entry in offer.get("negotiation_log", []):
-        history_lines.append(f"  Round {entry.get('round', '?')}: User said: \"{entry.get('objection', '')}\" → AI responded: \"{entry.get('response', '')[:100]}...\"")
-    history = "\n".join(history_lines) if history_lines else "  (First negotiation round)"
-    
-    if not settings.has_groq_key:
-        # Mock negotiation
-        if round_num == 1:
-            new_rate = max(offer["interest_rate"] - 0.25, min_rate)
-            new_emi = _calculate_emi(offer["eligible_amount"], new_rate, offer["default_tenure_months"])
+def _build_tenure_table(amount: float, rate: float, current_tenure: int) -> str:
+    """Build a plain-text EMI table for all available tenures."""
+    lines = []
+    for t in _TENURE_OPTIONS:
+        emi = _calculate_emi(amount, rate, t)
+        marker = "  ← current" if t == current_tenure else ""
+        years = t // 12
+        extra = f" ({years} yr)" if years >= 1 else ""
+        lines.append(f"  {t:3d} months{extra}: ₹{emi:,.0f}/mo{marker}")
+    return "\n".join(lines)
+
+
+def _mock_negotiate(offer: dict, objection: str, round_num: int, min_rate: float) -> dict:
+    """
+    Rule-based fallback when no Groq key is available.
+    Detects intent (tenure vs rate vs amount) from keywords.
+    """
+    import re
+    obj_lower = objection.lower()
+    amount = offer["eligible_amount"]
+    rate = offer["interest_rate"]
+    tenure = offer["default_tenure_months"]
+
+    # ── Tenure extension intent ──────────────────────────────────
+    tenure_kw = re.search(
+        r"\b(extend|longer|more years?|increase tenure|higher tenure|"
+        r"(\d+)\s*year|(\d+)\s*yr|reduce emi|lower emi|smaller emi|monthly)\b",
+        obj_lower,
+    )
+    # Explicit year mention: "5 years", "60 months"
+    year_match = re.search(r"\b(\d+)\s*year", obj_lower)
+    month_match = re.search(r"\b(\d+)\s*month", obj_lower)
+
+    if year_match:
+        requested_months = int(year_match.group(1)) * 12
+        new_tenure = max(_MIN_TENURE, min(_MAX_TENURE, requested_months))
+    elif month_match:
+        requested_months = int(month_match.group(1))
+        new_tenure = max(_MIN_TENURE, min(_MAX_TENURE, requested_months))
+    elif tenure_kw:
+        # Pick next step up from current tenure
+        options_above = [t for t in _TENURE_OPTIONS if t > tenure]
+        new_tenure = options_above[0] if options_above else _MAX_TENURE
+    else:
+        new_tenure = None
+
+    if new_tenure and new_tenure != tenure:
+        new_emi = _calculate_emi(amount, rate, new_tenure)
+        years_label = f"{new_tenure // 12} year{'s' if new_tenure // 12 != 1 else ''}"
+        return {
+            "response_text": (
+                f"Absolutely! I can extend your tenure to {new_tenure} months ({years_label}), "
+                f"which brings your EMI down to ₹{new_emi:,.0f}/month at the same {rate}% rate. "
+                f"That's well within our maximum tenure of {_MAX_TENURE} months."
+            ),
+            "adjusted_offer": {
+                "amount": amount,
+                "rate": rate,
+                "tenure": new_tenure,
+                "emi": new_emi,
+            },
+            "is_final": False,
+        }
+
+    # ── Rate reduction intent ────────────────────────────────────
+    if round_num <= 2:
+        new_rate = max(rate - 0.25, min_rate)
+        new_emi = _calculate_emi(amount, new_rate, tenure)
+        if new_rate < rate:
             return {
-                "response_text": f"I understand your concern. Let me see what I can do — I can bring your rate down to {new_rate}%. That would make your EMI ₹{new_emi:,.0f}. Shall we proceed with this?",
+                "response_text": (
+                    f"I understand your concern — let me see what I can do. "
+                    f"I can bring the rate down to {new_rate}%, making your EMI ₹{new_emi:,.0f}/month. "
+                    f"We can also extend the tenure up to {_MAX_TENURE} months if you'd like a lower EMI."
+                ),
                 "adjusted_offer": {
-                    "amount": offer["eligible_amount"],
-                    "rate": new_rate,
-                    "tenure": offer["default_tenure_months"],
-                    "emi": new_emi,
+                    "amount": amount, "rate": new_rate,
+                    "tenure": tenure, "emi": new_emi,
                 },
                 "is_final": False,
             }
-        else:
-            return {
-                "response_text": f"I've already given you the best possible rate for your credit profile. This is genuinely competitive compared to market rates of 14-18% for similar profiles. Shall I extend the tenure to reduce your EMI instead?",
-                "adjusted_offer": None,
-                "is_final": False,
-            }
-    
+
+    # ── Round 3+ fallback ────────────────────────────────────────
+    next_tenure = next((t for t in _TENURE_OPTIONS if t > tenure), _MAX_TENURE)
+    next_emi = _calculate_emi(amount, rate, next_tenure)
+    return {
+        "response_text": (
+            f"The rate of {rate}% is already the most competitive I can offer for your profile. "
+            f"However, I can extend your tenure to {next_tenure} months, which would reduce your EMI to ₹{next_emi:,.0f}/month — "
+            f"would that work for you?"
+        ),
+        "adjusted_offer": None,
+        "is_final": False,
+    }
+
+
+async def _negotiate(offer: dict, objection: str, round_num: int, max_rounds: int = 999) -> dict:
+    """LLM-powered negotiation micro-agent with intent-aware strategy."""
+
+    original_rate = offer.get("rate_breakdown", {}).get("base_rate", offer["interest_rate"])
+    min_rate = max(original_rate - 1.0, 9.0)  # max 1% total discount
+    credit_score = offer.get("credit_score", 650)
+    risk_persona = offer.get("risk_persona", "moderate_borrower")
+    amount = offer["eligible_amount"]
+    rate = offer["interest_rate"]
+    tenure = offer["default_tenure_months"]
+    emi = offer["default_emi"]
+
+    # Build history
+    history_lines = []
+    for entry in offer.get("negotiation_log", []):
+        history_lines.append(
+            f"  Round {entry.get('round', '?')}: "
+            f"User: \"{entry.get('objection', '')}\" "
+            f"→ AI: \"{entry.get('response', '')[:120]}...\""
+        )
+    history = "\n".join(history_lines) if history_lines else "  (First round)"
+
+    if not settings.has_groq_key:
+        return _mock_negotiate(offer, objection, round_num, min_rate)
+
     try:
         from groq import Groq
         client = Groq(api_key=settings.GROQ_API_KEY)
-        
+
+        tenure_table = _build_tenure_table(amount, rate, tenure)
+
         prompt = NEGOTIATION_PROMPT.format(
-            amount=offer["eligible_amount"],
-            rate=offer["interest_rate"],
-            tenure=offer["default_tenure_months"],
-            emi=offer["default_emi"],
+            amount=int(amount),
+            rate=rate,
+            tenure=tenure,
+            tenure_years=round(tenure / 12, 1),
+            emi=emi,
             credit_score=credit_score,
             risk_persona=risk_persona,
             original_rate=original_rate,
             min_rate=min_rate,
+            min_tenure=_MIN_TENURE,
+            max_tenure=_MAX_TENURE,
+            max_tenure_years=_MAX_TENURE // 12,
+            tenure_table=tenure_table,
             objection=objection,
             round_num=round_num,
             history=history,
         )
-        
+
         response = client.chat.completions.create(
             model=settings.GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.6,
-            max_tokens=512,
+            temperature=0.5,
+            max_tokens=600,
         )
-        
+
         raw = response.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-        
-        result = None
-        try:
-            result = json.loads(raw)
-        except json.JSONDecodeError:
-            import re
-            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-            if json_match:
-                try:
-                    result = json.loads(json_match.group())
-                except json.JSONDecodeError:
-                    pass
-        
-        if not result:
-            result = {
-                "response_text": raw.split('{')[0].strip() or "I understand your concern. This rate reflects your current credit profile, and I've already applied the best terms I can offer.",
-                "adjusted_offer": None,
-                "is_final": False,
-            }
-        
-        # Recalculate EMI for adjusted offer
+        validated = NegotiationResponse.from_raw(raw)
+        result = validated.model_dump()
+
+        # Server-side enforcement — always recompute EMI and enforce policy
         adj = result.get("adjusted_offer")
         if adj and isinstance(adj, dict):
-            # Enforce min rate
-            if adj.get("rate", 999) < min_rate:
-                adj["rate"] = min_rate
-            adj["emi"] = _calculate_emi(
-                adj.get("amount", offer["eligible_amount"]),
-                adj.get("rate", offer["interest_rate"]),
-                adj.get("tenure", offer["default_tenure_months"]),
-            )
-        
+            new_rate = max(min(adj.get("rate") or rate, 24.0), min_rate)
+            new_tenure = max(min(int(adj.get("tenure") or tenure), _MAX_TENURE), _MIN_TENURE)
+            new_amount = adj.get("amount") or amount
+            adj["rate"] = round(new_rate, 2)
+            adj["tenure"] = new_tenure
+            adj["amount"] = new_amount
+            adj["emi"] = _calculate_emi(new_amount, new_rate, new_tenure)
+
         return result
+
     except Exception as e:
-        return {
-            "response_text": "I appreciate your feedback. Let me review the terms once more.",
-            "adjusted_offer": None,
-            "is_final": False,
-            "error": str(e),
-        }
+        return _mock_negotiate(offer, objection, round_num, min_rate)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -424,18 +518,18 @@ async def negotiate_offer(session_id: str, req: NegotiationRequest):
             updated_offer["default_tenure_months"] = adj.get("tenure", offer["default_tenure_months"])
             updated_offer["default_emi"] = adj.get("emi", offer["default_emi"])
             
-            # Regenerate EMI table with updated rate/amount
+            # Regenerate EMI table with updated rate/amount/tenure
             new_amount = updated_offer["eligible_amount"]
             new_rate = updated_offer["interest_rate"]
-            tenures = [12, 24, 36, 48, 60]
             emi_table = []
-            for months in tenures:
-                emi = _calculate_emi(new_amount, new_rate, months)
-                total_payment = emi * months
+            for months in _TENURE_OPTIONS:
+                emi_val = _calculate_emi(new_amount, new_rate, months)
+                total_payment = emi_val * months
                 total_interest = total_payment - new_amount
                 emi_table.append({
                     "tenure_months": months,
-                    "emi": round(emi, 2),
+                    "tenure_years": round(months / 12, 1),
+                    "emi": round(emi_val, 2),
                     "total_payment": round(total_payment, 2),
                     "total_interest": round(total_interest, 2),
                 })
@@ -459,6 +553,12 @@ async def negotiate_offer(session_id: str, req: NegotiationRequest):
             "round": current_round,
             "max_rounds": 999,
             "is_final": result.get("is_final", False),
+            "policy": {
+                "min_rate": max(updated_offer.get("rate_breakdown", {}).get("base_rate", updated_offer["interest_rate"]) - 1.0, 9.0),
+                "min_tenure_months": _MIN_TENURE,
+                "max_tenure_months": _MAX_TENURE,
+                "max_tenure_years": _MAX_TENURE // 12,
+            },
             "current_offer": updated_offer,
         }
     except HTTPException:

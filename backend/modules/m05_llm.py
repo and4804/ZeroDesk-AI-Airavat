@@ -14,6 +14,7 @@ from config import settings
 from database import get_db
 from session_store import store
 from events import audit
+from models.llm_responses import AssessmentResponse
 
 router = APIRouter(prefix="/api/llm", tags=["M05 - LLM"])
 
@@ -116,27 +117,15 @@ async def _run_llm_analysis(transcript: str, fields: dict) -> dict:
         )
         
         raw = response.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-        
-        result = {}
-        try:
-            result = json.loads(raw)
-        except json.JSONDecodeError:
-            import re
-            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-            if json_match:
-                try:
-                    result = json.loads(json_match.group())
-                except json.JSONDecodeError:
-                    pass
 
-        if not result:
-            print(f"[WARN] Failed to parse JSON from LLM: {raw}")
+        try:
+            validated = AssessmentResponse.from_raw(raw)
+            result = validated.model_dump()
+            result["model"] = settings.GROQ_MODEL
+            return result
+        except Exception as parse_err:
+            print(f"[WARN] M05 Pydantic validation failed: {parse_err}")
             return {"error": "json parse failed", "model": settings.GROQ_MODEL}
-            
-        result["model"] = settings.GROQ_MODEL
-        return result
         
     except Exception as e:
         print(f"[WARN] LLM analysis failed: {e}")

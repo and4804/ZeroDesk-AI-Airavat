@@ -83,6 +83,29 @@ class SessionStore:
             session = self._sessions.get(session_id)
             if session:
                 session["vision_results"].append(result)
+
+    def get_vision_avg_liveness(self, session_id: str) -> float:
+        """Compute rolling average liveness score from all captured frames."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return 0.85  # default: assume live (benefit of doubt)
+        results = session.get("vision_results", [])
+        if not results:
+            return 0.85
+        scores = [r.get("liveness_score", 0) for r in results if r.get("liveness_score") is not None]
+        return round(sum(scores) / len(scores), 3) if scores else 0.85
+
+    def get_consent_status(self, session_id: str) -> bool:
+        """Return True if consent has been positively obtained for this session."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+        consent = session.get("consent")
+        if not consent:
+            return False
+        if isinstance(consent, dict):
+            return bool(consent.get("is_consent", False))
+        return False
     
     # --- Velocity tracking (for fraud detection) ---
     

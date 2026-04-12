@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(p['applicant_id'], p['name']\\) for p in d]\")",
+      "Bash(python3 -c ':*)",
+      "Bash(python -c ':*)",
+      "Bash(python -c \"from geopy.geocoders import Nominatim; print\\('geopy OK:', Nominatim.__module__\\)\")",
+      "Bash(python -c \"from geopy.geocoders import Nominatim; print\\('geopy OK'\\)\")",
+      "Bash(pip --version)",
+      "Bash(python -m pip install geopy -q)",
+      "Bash(grep -v \"^$\\\\|notice\")",
+      "Bash(python -c \"from geopy.geocoders import Nominatim; print\\('geopy OK, version:', __import__\\('geopy'\\).__version__\\)\")",
+      "Bash(python -m pip install geopy)"
+    ]
+  }
+}

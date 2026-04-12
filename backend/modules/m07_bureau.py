@@ -175,20 +175,56 @@ async def check_bureau(session_id: str, req: BureauCheckRequest = None):
     
     applicant_id = (req.applicant_id if req else None) or session.get("applicant_id") or session_id[:8]
     
-    # Call bureau mock service
+    # Gather cross-module signals to pass to module07's R06/R07/R08 rules
+    fraud_result = session.get("fraud_score", {})
+    fraud_composite = int(fraud_result.get("composite_score", 0)) if fraud_result else 0
+    liveness_avg = store.get_vision_avg_liveness(session_id)
+    consent_detected = store.get_consent_status(session_id)
+
     bureau_data = {}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{settings.BUREAU_MOCK_URL}/api/bureau/{applicant_id}")
+            resp = await client.get(
+                f"{settings.BUREAU_MOCK_URL}/api/bureau/{applicant_id}",
+                params={
+                    "fraud_score": fraud_composite,
+                    "liveness_avg": liveness_avg,
+                    "consent_detected": str(consent_detected).lower(),
+                    "session_id": session_id,
+                }
+            )
             if resp.status_code == 200:
-                bureau_data = resp.json()
+                raw = resp.json()
+                # Normalize module07's BureauResponse schema to internal format
+                # module07 returns: credit_score, active_loan_count, dpd_history (list of dicts),
+                # written_off_accounts, foir, inquiry_count_90d, eligibility_decision, rules_evaluated
+                if "eligibility_decision" in raw:
+                    bureau_data = {
+                        "credit_score": raw.get("credit_score", 650),
+                        "active_loans": raw.get("active_loan_count", 0),
+                        "dpd_history": [
+                            e.get("days", 0)
+                            for e in raw.get("dpd_history", [])
+                            if isinstance(e, dict)
+                        ],
+                        "written_off_accounts": raw.get("written_off_accounts", 0),
+                        "foir": raw.get("foir"),
+                        "inquiry_count_90d": raw.get("inquiry_count_90d", 0),
+                        # Preserve module07's own decision for audit trail
+                        "bureau_own_decision": raw.get("eligibility_decision"),
+                        "bureau_rules_evaluated": raw.get("rules_evaluated", []),
+                        "response_source": raw.get("response_source", "mock"),
+                    }
+                else:
+                    # Fallback: old bureau-mock format
+                    bureau_data = raw
             else:
                 bureau_data = {
                     "credit_score": 650,
                     "active_loans": 1,
                     "dpd_history": [0],
                     "written_off_accounts": 0,
-                    "error": "Bureau service returned non-200",
+                    "error": f"Bureau returned {resp.status_code}",
                 }
     except httpx.TimeoutException:
         bureau_data = {
@@ -196,7 +232,7 @@ async def check_bureau(session_id: str, req: BureauCheckRequest = None):
             "active_loans": 0,
             "dpd_history": [],
             "written_off_accounts": 0,
-            "error": "Bureau service timeout — using cached defaults",
+            "error": "Bureau service timeout",
         }
         await audit.emit(session_id, "BUREAU_TIMEOUT", "BUREAU", {"error": "timeout"})
     except Exception as e:
@@ -207,10 +243,6 @@ async def check_bureau(session_id: str, req: BureauCheckRequest = None):
             "written_off_accounts": 0,
             "error": str(e),
         }
-    
-    # Get fraud score for policy evaluation
-    fraud_result = session.get("fraud_score", {})
-    fraud_composite = fraud_result.get("composite_score", 0) if fraud_result else 0
     
     # Parse income from extracted fields
     monthly_income = req.monthly_income if req and req.monthly_income else 0
@@ -246,6 +278,9 @@ async def check_bureau(session_id: str, req: BureauCheckRequest = None):
     try:
         db = await get_db()
         try:
+            combined_rules = json.dumps(
+                bureau_data.get("bureau_rules_evaluated", []) + policy["evaluations"]
+            )
             await db.execute(
                 """INSERT INTO bureau_results
                    (session_id, applicant_id, credit_score, active_loans, dpd_history,
@@ -260,7 +295,7 @@ async def check_bureau(session_id: str, req: BureauCheckRequest = None):
                     bureau_data.get("written_off_accounts", 0),
                     policy["decision"],
                     f"{policy['rules_passed']}/{policy['rules_evaluated']} rules passed",
-                    json.dumps(policy["evaluations"]),
+                    combined_rules,
                 ),
             )
             await db.commit()

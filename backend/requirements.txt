@@ -29,8 +29,17 @@ numpy<2
 httpx==0.28.1
 aiohttp==3.11.17
 
+# Geo (M06 fraud — haversine city mismatch signal)
+geopy>=2.4.1
+
 # Crypto
 cryptography==44.0.3
+
+# Semantic similarity (M03 consent detection)
+sentence-transformers>=2.7.0
+
+# PDF export (M10 audit report)
+reportlab>=4.0.0
 
 # Utilities
 pydantic==2.11.1

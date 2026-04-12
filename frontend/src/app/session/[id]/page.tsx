@@ -69,6 +69,25 @@ const INTERVIEW_LABELS: Record<string, string> = {
   AWAIT_CONSENT: 'Consent',
 };
 
+const PIPELINE_STAGES = [
+  { key: 'SESSION_INIT',       label: 'Start',     icon: '🔗' },
+  { key: 'METADATA_CAPTURE',   label: 'Device',    icon: '📱' },
+  { key: 'INTERVIEW_GREETING', label: 'Greeting',  icon: '👋' },
+  { key: 'AWAIT_NAME',         label: 'Name',      icon: '🪪' },
+  { key: 'AWAIT_AGE',          label: 'Age',       icon: '🎂' },
+  { key: 'AWAIT_EMPLOYMENT',   label: 'Job',       icon: '💼' },
+  { key: 'AWAIT_INCOME',       label: 'Income',    icon: '💵' },
+  { key: 'AWAIT_LOAN_PURPOSE', label: 'Purpose',   icon: '🎯' },
+  { key: 'AWAIT_AMOUNT',       label: 'Amount',    icon: '💰' },
+  { key: 'AWAIT_CONSENT',      label: 'Consent',   icon: '✅' },
+  { key: 'LIVENESS_CHECK',     label: 'Liveness',  icon: '👤' },
+  { key: 'LLM_ANALYSIS',       label: 'Analysis',  icon: '🧠' },
+  { key: 'FRAUD_SCORING',      label: 'Fraud',     icon: '🛡️' },
+  { key: 'BUREAU_CHECK',       label: 'Bureau',    icon: '🏦' },
+  { key: 'OFFER_GENERATION',   label: 'Offer',     icon: '💎' },
+  { key: 'SESSION_COMPLETE',   label: 'Done',      icon: '🎉' },
+];
+
 // ──────────────────────────────────────────────────────────────────
 // Component
 // ──────────────────────────────────────────────────────────────────
@@ -98,6 +117,9 @@ export default function SessionPage() {
   const [error, setError] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
 
+  // Guardrail banner
+  const [guardrail, setGuardrail] = useState<{ off_topic: boolean; redirect_msg?: string } | null>(null);
+
   // Text fallback
   const [textInput, setTextInput] = useState('');
   const [micEnabled, setMicEnabled] = useState(true);
@@ -113,6 +135,11 @@ export default function SessionPage() {
   const shouldListenRef = useRef(true);
   const aiLockedRef = useRef(false);  // HARD LOCK — blocks all mic input while AI is active
   const isInitRef = useRef(false);    // Prevents React strict mode double-init
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  // Stable refs for values used inside recognition callbacks — avoids stale closures
+  const statusRef = useRef(status);
+  const micEnabledRef = useRef(micEnabled);
   const modeRef = useRef<ConversationMode>('interview');  // Synced ref for stale closure fix
   const offerRef = useRef<Record<string, unknown> | null>(null);  // Synced ref for stale closure fix
   const currentStageRef = useRef('SESSION_INIT');  // Synced ref for stale closure fix
@@ -123,6 +150,8 @@ export default function SessionPage() {
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { offerRef.current = offer; }, [offer]);
   useEffect(() => { currentStageRef.current = currentStage; }, [currentStage]);
+  useEffect(() => { statusRef.current = status; }, [status]);
+  useEffect(() => { micEnabledRef.current = micEnabled; }, [micEnabled]);
 
   // ──────────────────────────────────────────────────────────────
   // Helpers
@@ -206,8 +235,9 @@ export default function SessionPage() {
   // ──────────────────────────────────────────────────────────────
 
   const startListening = useCallback(() => {
-    // HARD CHECK — never start if AI is locked
-    if (!micEnabled || isSpeakingRef.current || aiLockedRef.current) return;
+    // All guards use refs — no stale closure risk
+    if (!micEnabledRef.current || isSpeakingRef.current || aiLockedRef.current) return;
+    if (statusRef.current !== 'active') return;
 
     const SpeechRecognition = (window as unknown as { SpeechRecognition?: new () => SpeechRecognitionInstance; webkitSpeechRecognition?: new () => SpeechRecognitionInstance }).SpeechRecognition
       || (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognitionInstance }).webkitSpeechRecognition;
@@ -218,12 +248,11 @@ export default function SessionPage() {
     }
 
     const recognition = new SpeechRecognition();
-    recognition.continuous = true;       // Keep listening — don't timeout on silence
-    recognition.interimResults = false;   // Only fire on final results
+    recognition.continuous = true;
+    recognition.interimResults = false;
     recognition.lang = 'en-US';
 
     recognition.onstart = () => {
-      // Double-check: if AI started speaking while we were starting, abort
       if (aiLockedRef.current || isSpeakingRef.current) {
         try { recognition.abort(); } catch { /* */ }
         return;
@@ -232,7 +261,6 @@ export default function SessionPage() {
     };
 
     recognition.onresult = (event: SpeechRecognitionEvent) => {
-      // Reject any result if AI is locked
       if (aiLockedRef.current || isSpeakingRef.current) return;
 
       let finalTranscript = '';
@@ -242,40 +270,46 @@ export default function SessionPage() {
         }
       }
       if (finalTranscript.trim()) {
-        // Stop continuous listening while we process
         try { recognition.stop(); } catch { /* */ }
         handleUserSpeech(finalTranscript.trim());
       }
     };
 
     recognition.onerror = (event: { error: string }) => {
-      if (event.error !== 'no-speech' && event.error !== 'aborted') {
+      const ignoredErrors = ['no-speech', 'aborted'];
+      if (!ignoredErrors.includes(event.error)) {
         console.warn('Speech recognition error:', event.error);
       }
-      // On no-speech error, restart (user just hasn't spoken yet)
-      if (event.error === 'no-speech') {
+      // network errors (Chrome) and no-speech both let onend handle the restart
+      if (event.error === 'no-speech' || event.error === 'network') {
         setVoiceState('listening');
-        return; // Let onend handle restart
+        return;
       }
       setVoiceState('idle');
     };
 
     recognition.onend = () => {
       setVoiceState('idle');
-      // Only auto-restart if AI is NOT speaking/locked
-      if (shouldListenRef.current && micEnabled && !isSpeakingRef.current && !aiLockedRef.current && status === 'active') {
+      // Use refs — never reads stale state values
+      if (
+        shouldListenRef.current &&
+        micEnabledRef.current &&
+        !isSpeakingRef.current &&
+        !aiLockedRef.current &&
+        statusRef.current === 'active'
+      ) {
         setTimeout(() => {
           if (shouldListenRef.current && !isSpeakingRef.current && !aiLockedRef.current) {
             startListening();
           }
-        }, 500);
+        }, 300);
       }
     };
 
     recognitionRef.current = recognition;
     try { recognition.start(); } catch { /* already started */ }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [micEnabled, status]);
+  }, []);
 
   // ──────────────────────────────────────────────────────────────
   // Process user speech/text
@@ -332,6 +366,16 @@ export default function SessionPage() {
         }
       }
 
+      // 3b. Guardrail — check topic relevance (non-blocking)
+      api.checkGuardrail(text).then(gr => {
+        if (!gr.is_relevant) {
+          setGuardrail({ off_topic: true, redirect_msg: gr.redirect_msg ?? undefined });
+          setTimeout(() => setGuardrail(null), 5000);
+        } else {
+          setGuardrail(null);
+        }
+      }).catch(() => { /* guardrail is advisory, never block the flow */ });
+
       if (currentMode === 'interview') {
         await handleInterviewMessage(text);
       } else {
@@ -349,20 +393,18 @@ export default function SessionPage() {
     } finally {
       setIsProcessing(false);
       shouldListenRef.current = true;
-      // Directly create and start a fresh SpeechRecognition instance
-      // (bypasses stale closure in startListening useCallback)
-      if (micEnabled && status === 'active' && !aiLockedRef.current) {
+      // Use refs so we never read stale state values
+      if (micEnabledRef.current && statusRef.current === 'active' && !aiLockedRef.current) {
         startListening();
-      } else {
-        // If AI is still in cooldown, wait for it then restart
+      } else if (micEnabledRef.current && statusRef.current === 'active') {
+        // AI still in TTS cooldown — poll until unlocked then restart
         const waitForUnlock = setInterval(() => {
           if (!aiLockedRef.current && !isSpeakingRef.current) {
             clearInterval(waitForUnlock);
             startListening();
           }
-        }, 500);
-        // Safety: clear after 10 seconds
-        setTimeout(() => clearInterval(waitForUnlock), 10000);
+        }, 300);
+        setTimeout(() => clearInterval(waitForUnlock), 12000);
       }
     }
   }
@@ -556,6 +598,20 @@ export default function SessionPage() {
       const msg = 'Congratulations! Your loan has been approved and the offer is accepted. You\'ll receive the documentation shortly. Thank you for banking with us!';
       addMessage('ai', msg, 'SESSION_COMPLETE');
       await speak(msg);
+
+      // Upload & clip-extract session recording (non-blocking, best-effort)
+      try {
+        const recorder = mediaRecorderRef.current;
+        if (recorder && recorder.state !== 'inactive') {
+          recorder.stop();
+          await new Promise<void>(r => { recorder.onstop = () => r(); setTimeout(r, 800); });
+        }
+        if (recordedChunksRef.current.length > 0) {
+          const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+          await api.uploadVideo(sessionId, blob);
+          await api.extractVideoClips(sessionId);
+        }
+      } catch { /* non-critical — session already accepted */ }
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -632,12 +688,25 @@ export default function SessionPage() {
           const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
           streamRef.current = stream;
           if (videoRef.current) videoRef.current.srcObject = stream;
+          // Start background video recording
+          try {
+            const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+              ? 'video/webm;codecs=vp9' : 'video/webm';
+            const recorder = new MediaRecorder(stream, { mimeType });
+            recordedChunksRef.current = [];
+            recorder.ondataavailable = (e) => {
+              if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+            };
+            recorder.start(1000);
+            mediaRecorderRef.current = recorder;
+          } catch { /* recording API not available */ }
         } catch {
           console.warn('Camera/mic access denied — running in text-only mode');
           setMicEnabled(false);
         }
 
         setStatus('active');
+        statusRef.current = 'active';   // sync ref immediately — don't wait for re-render
         setCurrentStage('INTERVIEW_GREETING');
 
         // Get first interview question
@@ -711,6 +780,7 @@ export default function SessionPage() {
 
   const modeLabel = mode === 'interview' ? 'Interview' : mode === 'negotiating' ? 'Negotiation' : mode === 'chatting' ? 'Chatting' : 'Complete';
   const modeClass = `mode-${mode === 'interview' ? 'interview' : mode === 'negotiating' ? 'negotiating' : mode === 'chatting' ? 'chatting' : 'complete'}`;
+  const currentStageMeta = PIPELINE_STAGES.find((stage) => stage.key === currentStage);
 
   return (
     <main className="min-h-screen p-4 max-w-7xl mx-auto">
@@ -744,6 +814,15 @@ export default function SessionPage() {
               <div key={i} className={`interview-step ${i < interviewStep - 1 ? 'interview-step-done' : i === interviewStep - 1 ? 'interview-step-active' : ''}`} />
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Guardrail banner */}
+      {guardrail?.off_topic && (
+        <div className="mb-4 flex items-start gap-3 px-4 py-3 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-300 text-sm animate-pulse">
+          <span className="text-lg leading-none">⚠️</span>
+          <span>{guardrail.redirect_msg || 'Please keep your response relevant to your loan application.'}</span>
+          <button onClick={() => setGuardrail(null)} className="ml-auto text-amber-400/60 hover:text-amber-300">✕</button>
         </div>
       )}
 
@@ -800,11 +879,17 @@ export default function SessionPage() {
               {/* Mic toggle */}
               <button
                 onClick={() => {
-                  setMicEnabled(!micEnabled);
-                  if (micEnabled && recognitionRef.current) {
-                    try { recognitionRef.current.stop(); } catch { /* */ }
+                  const next = !micEnabledRef.current;
+                  micEnabledRef.current = next;   // sync ref immediately
+                  setMicEnabled(next);
+                  if (!next) {
+                    // Muting
+                    if (recognitionRef.current) {
+                      try { recognitionRef.current.stop(); } catch { /* */ }
+                    }
                     shouldListenRef.current = false;
                   } else {
+                    // Unmuting
                     shouldListenRef.current = true;
                     startListening();
                   }
@@ -887,36 +972,57 @@ export default function SessionPage() {
                 </div>
                 <div className="text-center p-3 rounded-xl bg-emerald-500/10">
                   <div className="text-xs text-slate-400">Tenure</div>
-                  <div className="text-xl font-bold text-emerald-400">{offer.default_tenure_months as number}mo</div>
+                  <div className="text-xl font-bold text-emerald-400">
+                    {offer.default_tenure_months as number}mo
+                  </div>
+                  <div className="text-[10px] text-slate-500 mt-0.5">
+                    {((offer.default_tenure_months as number) / 12).toFixed(1)} yrs
+                  </div>
                 </div>
                 <div className="text-center p-3 rounded-xl bg-amber-500/10">
-                  <div className="text-xs text-slate-400">EMI</div>
+                  <div className="text-xs text-slate-400">EMI / month</div>
                   <div className="text-xl font-bold text-amber-400">₹{Math.round(offer.default_emi as number).toLocaleString()}</div>
                 </div>
               </div>
 
-              {/* EMI Table */}
-              {(offer.emi_table as Array<{tenure_months: number; emi: number; total_payment: number; total_interest: number}>)?.length > 0 && (
+              {/* EMI Table — all tenure options */}
+              {(offer.emi_table as Array<{tenure_months: number; tenure_years?: number; emi: number; total_payment: number; total_interest: number}>)?.length > 0 && (
                 <div className="mb-4 overflow-x-auto">
-                  <table className="data-table text-sm">
+                  <table className="data-table text-xs">
                     <thead>
-                      <tr><th>Tenure</th><th>Monthly EMI</th><th>Total Payment</th><th>Total Interest</th></tr>
+                      <tr>
+                        <th>Tenure</th>
+                        <th>Monthly EMI</th>
+                        <th>Total Payment</th>
+                        <th>Total Interest</th>
+                      </tr>
                     </thead>
                     <tbody>
-                      {(offer.emi_table as Array<{tenure_months: number; emi: number; total_payment: number; total_interest: number}>).map(row => (
-                        <tr key={row.tenure_months} className={row.tenure_months === offer.default_tenure_months ? 'bg-indigo-500/10' : ''}>
-                          <td>{row.tenure_months} months</td>
-                          <td>₹{Math.round(row.emi).toLocaleString()}</td>
-                          <td>₹{Math.round(row.total_payment).toLocaleString()}</td>
-                          <td>₹{Math.round(row.total_interest).toLocaleString()}</td>
-                        </tr>
-                      ))}
+                      {(offer.emi_table as Array<{tenure_months: number; tenure_years?: number; emi: number; total_payment: number; total_interest: number}>).map(row => {
+                        const isCurrent = row.tenure_months === (offer.default_tenure_months as number);
+                        const yrs = row.tenure_years ?? row.tenure_months / 12;
+                        return (
+                          <tr key={row.tenure_months} className={isCurrent ? 'bg-indigo-500/15 font-semibold' : ''}>
+                            <td>
+                              {row.tenure_months} mo
+                              <span className="text-slate-500 ml-1">({yrs.toFixed(1)} yr)</span>
+                              {isCurrent && <span className="ml-1 text-[9px] text-indigo-400 uppercase tracking-wide">current</span>}
+                            </td>
+                            <td className={isCurrent ? 'text-amber-400' : ''}>
+                              ₹{Math.round(row.emi).toLocaleString()}
+                            </td>
+                            <td>₹{Math.round(row.total_payment).toLocaleString()}</td>
+                            <td>₹{Math.round(row.total_interest).toLocaleString()}</td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
+                  <p className="text-[10px] text-slate-600 mt-1">Max tenure: 84 months (7 years) · Rate floor: see advisor</p>
                 </div>
               )}
 
-              <p className="text-xs text-slate-500 mb-4 text-center">💬 Negotiate by voice — &quot;Can I get a lower rate?&quot; or &quot;What about 48 months?&quot;</p>
+              <p className="text-xs text-slate-500 mb-4 text-center">💬 Say &quot;extend to 5 years&quot;, &quot;lower the rate&quot;, or &quot;what about 72 months?&quot;</p>
               <div className="flex gap-3">
                 <button onClick={handleAcceptOffer} disabled={isProcessing} className="btn-primary flex-1">
                   ✓ Accept Offer
@@ -935,7 +1041,15 @@ export default function SessionPage() {
               <h3 className="text-xl font-bold text-emerald-400 mb-2">Loan Approved!</h3>
               <p className="text-slate-400 mb-1">Amount: ₹{((offer.eligible_amount as number) / 100000).toFixed(1)} Lakhs at {offer.interest_rate as number}% p.a.</p>
               <p className="text-sm text-slate-500 mb-4">Reference: {(offer.offer_id as string)?.slice(0, 8)}</p>
-              <a href="/dashboard" className="btn-secondary text-sm">View in Dashboard →</a>
+              <div className="flex gap-3 justify-center flex-wrap">
+                <button
+                  onClick={() => api.exportTranscript(sessionId).catch(() => {})}
+                  className="btn-secondary text-sm"
+                >
+                  ⬇ Download Transcript
+                </button>
+                <a href="/dashboard" className="btn-secondary text-sm">View in Dashboard →</a>
+              </div>
             </div>
           )}
         </div>
@@ -1022,7 +1136,9 @@ export default function SessionPage() {
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Stage</span>
-                <span className="text-slate-300 text-[10px] font-mono">{currentStage}</span>
+                <span className="text-slate-300 text-[10px] font-mono">
+                  {currentStageMeta ? `${currentStageMeta.icon} ${currentStageMeta.label}` : currentStage}
+                </span>
               </div>
             </div>
           </div>

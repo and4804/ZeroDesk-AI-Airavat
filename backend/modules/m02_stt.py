@@ -9,6 +9,7 @@ import tempfile
 import os
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from typing import Optional
 
@@ -16,6 +17,8 @@ from config import settings
 from database import get_db
 from session_store import store
 from events import audit
+from modules.m_guardrails import check_relevance
+from models.llm_responses import ExtractionResponse
 
 router = APIRouter(prefix="/api/stt", tags=["M02 - STT"])
 
@@ -108,32 +111,13 @@ Respond ONLY with valid JSON in this exact format, with NO trailing commas and N
             )
             
             raw = response.choices[0].message.content.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-                
-            fields = {}
-            # Strategy 1: Direct JSON parse
-            try:
-                fields = json.loads(raw)
-            except json.JSONDecodeError:
-                pass
-                
-            # Strategy 2: Find JSON object matching exact regex
-            if not fields:
-                json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-                if json_match:
-                    clean_raw = json_match.group()
-                    # Strip common Llama 3 trailing commas right before closing brace
-                    clean_raw = re.sub(r',\s*\}', '}', clean_raw)
-                    try:
-                        fields = json.loads(clean_raw)
-                    except json.JSONDecodeError:
-                        pass
 
-            if fields:
+            try:
+                validated = ExtractionResponse.from_raw(raw)
+                fields = validated.model_dump()
                 return {"fields": fields, "model": settings.GROQ_MODEL}
-            else:
-                print(f"[WARN] Failed to parse JSON from LLM on attempt {attempt + 1}: {raw}")
+            except Exception as parse_err:
+                print(f"[WARN] Pydantic validation failed on attempt {attempt + 1}: {parse_err}")
                 
         except Exception as e:
             print(f"[WARN] LLM extraction failed on attempt {attempt + 1}: {e}")
@@ -183,47 +167,84 @@ async def websocket_stt(websocket: WebSocket, session_id: str):
                     # Mock transcription for demo
                     text = f"[Mock transcript segment {segment_index}]"
                     confidence = 0.95
+                    word_timestamps: list[dict] = []
                 else:
                     # Real transcription with faster-whisper
+                    word_timestamps = []
                     try:
                         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                             tmp.write(audio_bytes)
                             tmp_path = tmp.name
-                        
+
                         segments_iter, info = model.transcribe(
                             tmp_path,
                             beam_size=1,
                             language="en",
                             vad_filter=True,
+                            word_timestamps=True,
                         )
-                        
+
                         parts = []
                         for seg in segments_iter:
                             parts.append(seg.text)
                             confidence = max(confidence, seg.avg_logprob)
-                        
+                            # Collect per-word timestamps for video clip extraction
+                            if hasattr(seg, "words") and seg.words:
+                                for w in seg.words:
+                                    word_timestamps.append({
+                                        "word": w.word.strip(),
+                                        "start": round(w.start, 3),
+                                        "end": round(w.end, 3),
+                                    })
+
                         text = " ".join(parts).strip()
                         os.unlink(tmp_path)
-                        
+
                         # Convert log prob to 0-1 confidence
                         import math
                         confidence = math.exp(confidence) if confidence < 0 else confidence
-                        
+
                     except Exception as e:
                         text = ""
+                        word_timestamps = []
                         print(f"[WARN] Whisper error: {e}")
-                
+
                 if text:
+                    # ── Guardrail check ──────────────────────────────────
+                    session = store.get(session_id)
+                    pipeline_stage = session.get("pipeline_stage", "") if session else ""
+                    # Only enforce guardrails during the interview flow
+                    interview_stages = {
+                        "INTERVIEW_GREETING", "AWAIT_NAME", "AWAIT_AGE",
+                        "AWAIT_EMPLOYMENT", "AWAIT_INCOME", "AWAIT_LOAN_PURPOSE",
+                        "AWAIT_AMOUNT", "AWAIT_CONSENT",
+                    }
+                    redirect_msg: str | None = None
+                    if pipeline_stage in interview_stages:
+                        # Determine next missing field for the redirect prompt
+                        fields = session.get("extracted_fields", {}) if session else {}
+                        field_order = ["name", "age", "employment_type", "monthly_income",
+                                       "loan_purpose", "requested_amount"]
+                        next_field = next(
+                            (f for f in field_order
+                             if not (fields.get(f) or {}).get("value")),
+                            None,
+                        )
+                        guard = check_relevance(text, next_field)
+                        if not guard["is_relevant"]:
+                            redirect_msg = guard["redirect_msg"]
+
                     segment = {
                         "index": segment_index,
                         "text": text,
                         "confidence": round(confidence, 3),
                         "timestamp": datetime.utcnow().isoformat(),
+                        "word_timestamps": word_timestamps,
                     }
-                    
-                    # Store in memory
+
+                    # Store in memory (word_timestamps stored for video clip extraction)
                     store.append_transcript(session_id, segment)
-                    
+
                     # Persist to DB
                     try:
                         db = await get_db()
@@ -238,13 +259,20 @@ async def websocket_stt(websocket: WebSocket, session_id: str):
                             await db.close()
                     except Exception:
                         pass
-                    
-                    # Send back to client
-                    await websocket.send_json({
+
+                    # Send back to client — include redirect if off-topic
+                    response_payload: dict = {
                         "type": "transcript",
                         "segment": segment,
-                    })
-                    
+                    }
+                    if redirect_msg:
+                        response_payload["guardrail"] = {
+                            "off_topic": True,
+                            "redirect_message": redirect_msg,
+                            "similarity": guard.get("similarity", 0),
+                        }
+
+                    await websocket.send_json(response_payload)
                     segment_index += 1
             
             elif msg.get("type") == "end":
@@ -373,6 +401,61 @@ async def extract_fields(session_id: str):
     })
     
     return {"session_id": session_id, **result}
+
+
+@router.get("/{session_id}/export")
+async def export_transcript(session_id: str):
+    """
+    Export the full session transcript as a plain-text file.
+    Format: Segment N [HH:MM:SS]: 'text...'
+    Returns text/plain with a Content-Disposition download header.
+    """
+    # Try memory first
+    session = store.get(session_id)
+    segments = []
+    if session and session.get("transcript"):
+        segments = session["transcript"]
+    else:
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                "SELECT segment_index, text, confidence, created_at FROM transcripts "
+                "WHERE session_id = ? ORDER BY segment_index",
+                (session_id,),
+            )
+            rows = await cursor.fetchall()
+            segments = [dict(r) for r in rows]
+        finally:
+            await db.close()
+
+    if not segments:
+        raise HTTPException(status_code=404, detail="No transcript found for this session")
+
+    lines: list[str] = [
+        f"AgentFinance AI — Session Transcript",
+        f"Session ID : {session_id}",
+        f"Exported   : {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
+        "=" * 60,
+        "",
+    ]
+    for seg in segments:
+        # Normalise timestamp to HH:MM:SS
+        ts_raw = seg.get("timestamp") or seg.get("created_at") or ""
+        try:
+            dt = datetime.fromisoformat(ts_raw.rstrip("Z"))
+            ts_fmt = dt.strftime("%H:%M:%S")
+        except Exception:
+            ts_fmt = "00:00:00"
+        idx = seg.get("index", seg.get("segment_index", "?"))
+        conf = seg.get("confidence", 0)
+        lines.append(f"Segment {idx} [{ts_fmt}] (conf {conf:.2f}): {seg['text']}")
+
+    content = "\n".join(lines)
+    filename = f"transcript-{session_id[:8]}.txt"
+    return PlainTextResponse(
+        content=content,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/{session_id}/add-text")

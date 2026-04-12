@@ -24,6 +24,19 @@ async def lifespan(app: FastAPI):
     # Startup
     print("[*] AgentFinance AI Backend starting...")
     await init_db()
+    # Auto-download ONNX age model for M04 vision (85MB, one-time)
+    import urllib.request as _urlreq, os as _os
+    _model_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "age_model.onnx")
+    if not _os.path.exists(_model_path):
+        print("[*] Downloading ONNX age model (~85MB, runs once)...")
+        try:
+            _urlreq.urlretrieve(
+                "https://github.com/onnx/models/raw/main/validated/vision/body_analysis/age_gender/models/age_googlenet.onnx",
+                _model_path
+            )
+            print("[OK] ONNX age model ready")
+        except Exception as _e:
+            print(f"[WARN] ONNX model download failed: {_e} — M04 will use mock liveness")
     print(f"[+] Backend ready at http://localhost:{settings.BACKEND_PORT}")
     print(f"[+] Bureau Mock expected at {settings.BUREAU_MOCK_URL}")
     yield
@@ -62,6 +75,8 @@ from modules.m07_bureau import router as m07_router
 from modules.m08_offer import router as m08_router
 from modules.m09_orchestrator import router as m09_router
 from modules.m10_compliance import router as m10_router
+from modules.m_video import router as video_router
+from modules.m_guardrails import router as guardrails_router
 
 app.include_router(m01_router)
 app.include_router(m02_router)
@@ -73,6 +88,8 @@ app.include_router(m07_router)
 app.include_router(m08_router)
 app.include_router(m09_router)
 app.include_router(m10_router)
+app.include_router(video_router)
+app.include_router(guardrails_router)
 
 
 # ──────────────────────────────────────────────────────────────────

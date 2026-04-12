@@ -15,9 +15,14 @@ if (-not (Test-Path ".\backend\data")) {
     New-Item -ItemType Directory -Path ".\backend\data" -Force | Out-Null
 }
 
-# Start Bureau Mock (port 8001)
-Write-Host "📊 Starting Bureau Mock on port 8001..." -ForegroundColor Green
-$bureau = Start-Process -FilePath "python" -ArgumentList "main.py" -WorkingDirectory ".\bureau-mock" -PassThru -NoNewWindow
+# Start Module07 Bureau (port 8001)
+Write-Host "📦 Installing module07 dependencies..." -ForegroundColor Yellow
+Start-Process -FilePath "pip" -ArgumentList "install", "-r", "requirements.txt" `
+    -WorkingDirectory ".\module07" -Wait -NoNewWindow
+
+Write-Host "🏦 Starting Module07 Bureau (M07) on port 8001..." -ForegroundColor Green
+$bureau = Start-Process -FilePath "python" -ArgumentList "-m", "app.main" `
+    -WorkingDirectory ".\module07" -PassThru -NoNewWindow
 
 # Wait a moment for bureau to start
 Start-Sleep -Seconds 2

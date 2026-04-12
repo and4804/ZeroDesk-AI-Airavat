@@ -44,7 +44,21 @@ _prev_nose_positions = {}
 _liveness_history = {}
 _frame_counters = {}
 _session_age = {}
-_blink_history = {}
+
+# ── Blink rolling-window state (per session) ──────────────────────
+# _ear_window      : deque(maxlen=30) of recent EAR values
+# _blink_state     : "open" | "closing"  (state machine)
+# _blink_count     : total confirmed blinks in session
+# _closed_frames   : consecutive frames where EAR < threshold (current blink candidate)
+_ear_window: dict = {}
+_blink_state: dict = {}
+_blink_count: dict = {}
+_closed_frames: dict = {}   # replaces the broken deque attribute hack
+
+_EAR_CLOSE_THRESH = 0.25   # EAR below this → eye closing
+_EAR_OPEN_THRESH  = 0.30   # EAR above this → eye open (hysteresis gap)
+_BLINK_MIN_FRAMES = 2      # Minimum closed frames to count as a blink (not a glitch)
+_BLINK_MAX_FRAMES = 8      # More than this → likely squint / look-away, not blink
 
 
 def _get_face_mesh():
@@ -231,14 +245,38 @@ async def analyze_frame(req: VisionAnalyzeRequest):
             lm = results.multi_face_landmarks[0].landmark
             face_detected = True
 
-            # EAR blink detection
+            # ── EAR blink detection (30-frame rolling window, drop-then-rise) ──
             ear = (_ear_calc(lm, LEFT_EYE, w, h) + _ear_calc(lm, RIGHT_EYE, w, h)) / 2
-            _blink_history[sid] = _blink_history.get(sid, 0)
-            if ear < 0.28:
-                _blink_history[sid] += 1
-            else:
-                _blink_history[sid] = 0
-            blink = 1 if _blink_history[sid] >= 2 else 0
+
+            # Initialise per-session state on first frame
+            if sid not in _ear_window:
+                _ear_window[sid]    = deque(maxlen=30)
+                _blink_state[sid]   = "open"
+                _blink_count[sid]   = 0
+                _closed_frames[sid] = 0
+
+            _ear_window[sid].append(ear)
+            state = _blink_state[sid]
+
+            blink = 0  # default: no new blink this frame
+            if state == "open":
+                if ear < _EAR_CLOSE_THRESH:
+                    _blink_state[sid]   = "closing"
+                    _closed_frames[sid] = 1
+            elif state == "closing":
+                if ear < _EAR_CLOSE_THRESH:
+                    _closed_frames[sid] += 1
+                    if _closed_frames[sid] > _BLINK_MAX_FRAMES:
+                        # Probably a squint / look-away — reset without counting
+                        _blink_state[sid]   = "open"
+                        _closed_frames[sid] = 0
+                elif ear > _EAR_OPEN_THRESH:
+                    # Eye re-opened — confirm blink if closed long enough
+                    if _closed_frames[sid] >= _BLINK_MIN_FRAMES:
+                        _blink_count[sid] += 1
+                        blink = 1
+                    _blink_state[sid]   = "open"
+                    _closed_frames[sid] = 0
 
             # Head movement (nose tracking)
             nose_x = lm[NOSE].x
@@ -289,7 +327,8 @@ async def analyze_frame(req: VisionAnalyzeRequest):
     # Flags
     if motion < 0.05:
         flags.append("low_motion")
-    if blink == 0:
+    total_blinks = _blink_count.get(sid, 0)
+    if total_blinks == 0 and _frame_counters.get(sid, 0) > 15:
         flags.append("no_blink")
     if head < 0.05:
         flags.append("no_head_movement")
@@ -325,6 +364,7 @@ async def analyze_frame(req: VisionAnalyzeRequest):
         "age_delta": round(age_delta, 1) if age_delta is not None else None,
         "age_difference": round(age_delta, 1) if age_delta is not None else None,  # mod04 compat
         "blink_detected": blink == 1,
+        "blink_count": int(_blink_count.get(sid, 0)),
         "head_pose": head_pose,
         "texture_score": round(texture * 500, 1),  # Scale back for compat
         "signals": {

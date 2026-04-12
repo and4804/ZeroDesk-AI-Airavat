@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import re
+import threading
 from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -19,6 +20,69 @@ from session_store import store
 from events import audit
 
 router = APIRouter(prefix="/api/consent", tags=["M03 - Consent"])
+
+# ──────────────────────────────────────────────────────────────────
+# sentence-transformers — lazy load, model loaded once in background
+# ──────────────────────────────────────────────────────────────────
+
+_st_model = None          # SentenceTransformer instance (or "unavailable")
+_st_embeddings = None     # pre-embedded canonical consent phrases (numpy array)
+_st_lock = threading.Lock()
+
+# Canonical phrases for semantic consent detection
+# Covers English + common Hindi/Hinglish transliterations
+_CANONICAL_CONSENT = [
+    "yes I agree to the loan application",
+    "I consent and authorize the bank to proceed",
+    "go ahead I accept the terms",
+    "haan theek hai aage badhiye",      # Hindi: yes fine please proceed
+    "I give my consent please continue",
+]
+
+_SEMANTIC_THRESHOLD = 0.78   # cosine similarity threshold
+
+
+def _load_st_model():
+    """Load SentenceTransformer model in a background thread at startup."""
+    global _st_model, _st_embeddings
+    try:
+        import numpy as np
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        embeddings = model.encode(_CANONICAL_CONSENT, normalize_embeddings=True)
+        with _st_lock:
+            _st_model = model
+            _st_embeddings = embeddings
+        print("[OK] M03: sentence-transformers model loaded (all-MiniLM-L6-v2)")
+    except Exception as e:
+        with _st_lock:
+            _st_model = "unavailable"
+            _st_embeddings = None
+        print(f"[WARN] M03: sentence-transformers unavailable — using regex only. ({e})")
+
+
+# Kick off background load (non-blocking)
+threading.Thread(target=_load_st_model, daemon=True).start()
+
+
+def _semantic_consent_score(text: str) -> float:
+    """
+    Compute max cosine similarity between `text` and canonical consent phrases.
+    Returns 0.0 if the model isn't ready or the library isn't installed.
+    """
+    with _st_lock:
+        model = _st_model
+        embeddings = _st_embeddings
+    if model is None or model == "unavailable" or embeddings is None:
+        return 0.0
+    try:
+        import numpy as np
+        vec = model.encode([text], normalize_embeddings=True)
+        sims = (embeddings @ vec.T).flatten()
+        return float(sims.max())
+    except Exception:
+        return 0.0
+
 
 # ──────────────────────────────────────────────────────────────────
 # Consent phrase patterns
@@ -49,10 +113,18 @@ OPT_OUT_PHRASES = [
 
 
 def _detect_consent(text: str) -> dict:
-    """Detect consent or opt-out phrases in text."""
+    """
+    Detect consent or opt-out in `text`.
+
+    Detection strategy (in priority order):
+      1. Regex opt-out patterns  (always takes priority)
+      2. Regex consent patterns  (fast path for standard phrases)
+      3. sentence-transformers cosine similarity ≥ 0.78 (semantic fallback —
+         catches Hindi/Hinglish and paraphrases not covered by regex)
+    """
     text_lower = text.lower().strip()
-    
-    # Check opt-out first (takes priority)
+
+    # 1. Opt-out check (always first)
     for pattern in OPT_OUT_PHRASES:
         match = re.search(pattern, text_lower)
         if match:
@@ -61,9 +133,11 @@ def _detect_consent(text: str) -> dict:
                 "is_consent": False,
                 "phrase": match.group(),
                 "type": "opt_out",
+                "method": "regex",
+                "similarity": None,
             }
-    
-    # Check consent phrases
+
+    # 2. Regex consent phrases
     for pattern in CONSENT_PHRASES:
         match = re.search(pattern, text_lower)
         if match:
@@ -72,9 +146,24 @@ def _detect_consent(text: str) -> dict:
                 "is_consent": True,
                 "phrase": match.group(),
                 "type": "verbal_consent",
+                "method": "regex",
+                "similarity": None,
             }
-    
-    return {"detected": False, "is_consent": False, "phrase": None, "type": None}
+
+    # 3. Semantic similarity via sentence-transformers
+    sim = _semantic_consent_score(text)
+    if sim >= _SEMANTIC_THRESHOLD:
+        return {
+            "detected": True,
+            "is_consent": True,
+            "phrase": text[:80],   # store the actual phrase for the audit trail
+            "type": "verbal_consent",
+            "method": "semantic",
+            "similarity": round(sim, 4),
+        }
+
+    return {"detected": False, "is_consent": False, "phrase": None, "type": None,
+            "method": "none", "similarity": round(sim, 4) if sim else None}
 
 
 def _hash_segment(text: str) -> str:

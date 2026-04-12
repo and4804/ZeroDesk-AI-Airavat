@@ -3,10 +3,12 @@ M10 — Compliance Dashboard, Audit Repository & Regulatory Report Generation
 Back-office APIs for session viewing, analytics, and audit report generation.
 """
 
+import asyncio
 import json
 import hashlib
 from datetime import datetime
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse, Response
 from typing import Optional
 
 from config import settings
@@ -195,11 +197,11 @@ async def get_session_detail(session_id: str):
 # ──────────────────────────────────────────────────────────────────
 
 @router.get("/sessions/{session_id}/report")
-async def generate_audit_report(session_id: str):
+async def generate_audit_report(session_id: str, format: Optional[str] = None):
     """
-    Generate a machine-readable regulatory audit report.
-    Contains all required compliance data from a single session.
-    Reconstructable from stored audit logs alone.
+    Generate a regulatory audit report.
+    - Default (JSON): machine-readable, cryptographically signed.
+    - ?format=pdf   : formatted PDF for regulatory filing.
     """
     detail = await get_session_detail(session_id)
     
@@ -245,6 +247,15 @@ async def generate_audit_report(session_id: str):
             "policy_decision": detail["bureau"].get("policy_decision") if detail["bureau"] else None,
             "policy_explanation": detail["bureau"].get("policy_explanation") if detail["bureau"] else None,
             "rule_evaluations": detail["bureau"].get("rule_evaluations") if detail["bureau"] else None,
+            # module07 cross-module signals that were passed to R06/R07/R08
+            "fraud_score_used_in_bureau": detail["fraud"].get("composite_score") if detail["fraud"] else None,
+            "liveness_avg_used_in_bureau": (
+                round(sum(v.get("liveness_score", 0) for v in detail["vision"]) / len(detail["vision"]), 3)
+                if detail.get("vision") and len(detail["vision"]) > 0 else None
+            ),
+            "consent_used_in_bureau": any(
+                c.get("is_consent", False) for c in detail["consent"]
+            ) if detail.get("consent") else False,
         },
         "offer_terms": {
             "eligible_amount": detail["offer"].get("eligible_amount") if detail["offer"] else None,
@@ -267,8 +278,89 @@ async def generate_audit_report(session_id: str):
     # Sign the report
     report_json = json.dumps(report, sort_keys=True, default=str)
     report["report_hash"] = hashlib.sha256(report_json.encode("utf-8")).hexdigest()
-    
+
+    # ── PDF branch ────────────────────────────────────────────────
+    if format and format.lower() == "pdf":
+        try:
+            from utils.report_pdf import build_pdf
+            pdf_bytes = build_pdf(report)
+            filename = f"audit_report_{session_id[:8]}.pdf"
+            return Response(
+                content=pdf_bytes,
+                media_type="application/pdf",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=501,
+                detail=f"PDF export unavailable: {exc}. Install reportlab>=4.0.0.",
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"PDF generation failed: {exc}")
+
     return report
+
+
+# ──────────────────────────────────────────────────────────────────
+# Live Audit Replay  (SSE)
+# ──────────────────────────────────────────────────────────────────
+
+@router.get("/sessions/{session_id}/replay")
+async def replay_audit_events(session_id: str, delay_ms: int = 600):
+    """
+    Stream all audit events for a session as Server-Sent Events (SSE),
+    one event per `delay_ms` milliseconds — use this to animate the
+    dashboard timeline stage-by-stage.
+
+    Each SSE message:
+        event: audit_event
+        data: { id, event_type, module, data, timestamp }
+
+    Terminal message:
+        event: done
+        data: {"session_id": "...", "total_events": N}
+    """
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT id, event_type, module, data, timestamp "
+            "FROM audit_events WHERE session_id = ? ORDER BY timestamp",
+            (session_id,),
+        )
+        rows = await cursor.fetchall()
+    finally:
+        await db.close()
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No audit events found for this session")
+
+    events = []
+    for r in rows:
+        e = dict(r)
+        try:
+            e["data"] = json.loads(e.get("data") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            e["data"] = {}
+        events.append(e)
+
+    delay_sec = max(0.1, min(delay_ms / 1000.0, 5.0))
+
+    async def _generate():
+        for evt in events:
+            payload = json.dumps(evt, default=str)
+            yield f"event: audit_event\ndata: {payload}\n\n"
+            await asyncio.sleep(delay_sec)
+        done_payload = json.dumps({"session_id": session_id, "total_events": len(events)})
+        yield f"event: done\ndata: {done_payload}\n\n"
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ──────────────────────────────────────────────────────────────────
